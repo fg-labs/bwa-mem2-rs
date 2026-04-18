@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Pre-commit hook: format + lint.
+# Skip with: git commit --no-verify
+# Run tests too with: BWA_MEM2_RS_PRECOMMIT_TEST=1 git commit
+set -euo pipefail
+
+if [[ ! -f "Cargo.toml" ]]; then
+    echo "error: not in bwa-mem2-rs root" >&2
+    exit 1
+fi
+
+echo "==> cargo ci-fmt"
+cargo ci-fmt
+
+echo "==> cargo ci-lint"
+cargo ci-lint
+
+if [[ "${BWA_MEM2_RS_PRECOMMIT_TEST:-0}" == "1" ]]; then
+    echo "==> cargo ci-test"
+    cargo ci-test
+fi

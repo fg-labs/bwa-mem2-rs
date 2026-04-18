@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["bwa-mem2-sys", "bwa-mem2-rs", "bwa-mem2-rs-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/fg-labs/bwa-mem2-rs"
+authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
+
+# Default clippy strictness; ci-lint promotes warnings to errors via -D warnings.
+# Pedantic is opinionated and noisy for a -sys crate with lots of FFI conversions.
+[workspace.lints.clippy]

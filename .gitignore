@@ -1,0 +1,9 @@
+/target
+Cargo.lock.bak
+.DS_Store
+*.bak
+*.orig
+*.rej
+
+# Local-only superpowers notes (specs/plans live outside version control).
+/docs/superpowers/
