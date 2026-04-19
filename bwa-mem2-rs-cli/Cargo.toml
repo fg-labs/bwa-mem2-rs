@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 categories = ["command-line-utilities", "science"]
 keywords = ["bioinformatics", "bwa", "alignment", "bam"]
+readme = "README.md"
 
 [[bin]]
 name = "bwa-rs"

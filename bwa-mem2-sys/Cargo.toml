@@ -10,6 +10,7 @@ authors.workspace = true
 categories = ["external-ffi-bindings", "science"]
 keywords = ["bioinformatics", "bwa", "alignment", "ngs"]
 links = "bwa-mem2"
+readme = "README.md"
 include = [
     "src/",
     "build.rs",
