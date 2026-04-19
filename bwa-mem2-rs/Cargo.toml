@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 categories = ["science", "api-bindings"]
 keywords = ["bioinformatics", "bwa", "alignment", "bam", "ngs"]
+readme = "README.md"
 
 [lib]
 path = "src/lib.rs"
