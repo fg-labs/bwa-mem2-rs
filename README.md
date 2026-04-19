@@ -1,5 +1,12 @@
 # bwa-mem2-rs
 
+[![CI](https://github.com/fg-labs/bwa-mem2-rs/actions/workflows/check.yml/badge.svg)](https://github.com/fg-labs/bwa-mem2-rs/actions/workflows/check.yml)
+[![crates.io: bwa-mem2-rs](https://img.shields.io/crates/v/bwa-mem2-rs.svg?label=bwa-mem2-rs)](https://crates.io/crates/bwa-mem2-rs)
+[![crates.io: bwa-mem2-sys](https://img.shields.io/crates/v/bwa-mem2-sys.svg?label=bwa-mem2-sys)](https://crates.io/crates/bwa-mem2-sys)
+[![crates.io: bwa-mem2-rs-cli](https://img.shields.io/crates/v/bwa-mem2-rs-cli.svg?label=bwa-mem2-rs-cli)](https://crates.io/crates/bwa-mem2-rs-cli)
+[![docs.rs](https://img.shields.io/docsrs/bwa-mem2-rs?label=docs.rs)](https://docs.rs/bwa-mem2-rs)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Rust FFI crate for [bwa-mem2](https://github.com/bwa-mem2/bwa-mem2) with packed-BAM output and caller-owned parallelism.
 
 Hosted under [`fg-labs/bwa-mem2-rs`](https://github.com/fg-labs/bwa-mem2-rs); it vendors [`fg-labs/bwa-mem2`](https://github.com/fg-labs/bwa-mem2) at the `fg-main` branch — our integration branch over upstream with Apple Silicon / NEON + Linux-arm64 / CI fixes applied.
