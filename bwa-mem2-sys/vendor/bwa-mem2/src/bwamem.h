@@ -265,8 +265,15 @@ int mem_kernel1_core(FMI_search *fmi, const mem_opt_t *opt,
                      bseq1_t *seq_,
                      int nseq,
                      mem_chain_v *chain_ar,
+                     mem_seed_t *seedBuf,
+                     int64_t seedBufSize,
                      mem_cache *mmc,
                      int tid);
+
+int mem_kernel2_core(FMI_search *fmi, const mem_opt_t *opt,
+                     bseq1_t *seq_, mem_alnreg_v *regs, int nseq,
+                     mem_chain_v *chain_ar, mem_cache *mmc,
+                     uint8_t *ref_string, int tid);
 
 void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize);
 
@@ -287,6 +294,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid);
 
+/* Given two alignment begin positions (rb) on the 2-bit-packed concat-with-
+ * reverse-complement index, infer the pair orientation (0=FF, 1=FR, 2=RF,
+ * 3=RR) and the distance between 5' ends. Exposed so that external consumers
+ * can share the same proper-pair classification used by mem_sam_pe's
+ * no_pairing fallback. */
+int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
+
 int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                      int64_t &pcnt, int64_t &pcnt8, kswr_t *aln,
                      int32_t, int32_t, int tid);
@@ -306,6 +320,32 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                const mem_pestat_t pes[4], uint64_t id, bseq1_t s[2],
                mem_alnreg_v a[2]);
+
+// Core pairing decision for a single read pair. Runs mate-rescue SW,
+// mem_mark_primary_se, optional MEM_F_PRIMARY5 reorder, mem_pair, is-multi
+// sanity check, q_pe/q_se computation, and the secondary<->primary
+// secondary_all patch. Does NOT emit SAM/BAM — callers do that.
+//
+// Output contract:
+//   * paired_out: set to 1 iff the paired branch was taken; 0 otherwise.
+//     Callers must always inspect *paired_out before reading z[] / q_se[].
+//   * z[], q_se[]: valid only when *paired_out == 1. On the no-pairing path
+//     they must be treated as undefined — mem_pair() can populate z[]
+//     before the is_multi early return, so their contents do not signal
+//     anything when *paired_out == 0.
+//   * extra_flag_out: on the paired path it is fully assembled (and
+//     includes 0x2 iff the paired alignment was preferred); on the
+//     no-pairing path it is only partial — the caller (or mem_sam_pe's
+//     no_pairing emission block) is responsible for OR-ing in 0x2 itself.
+//   * n_pri[]: always populated.
+//
+// Returns the number of mate-rescue hits produced (same meaning as the
+// historical `n` return of mem_sam_pe).
+int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
+                     const uint8_t *pac, const mem_pestat_t pes[4],
+                     uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
+                     int n_pri[2], int z[2], int q_se[2],
+                     int *extra_flag_out, int *paired_out);
 /**
  * Align a batch of sequences and generate the alignments in the SAM format
  *

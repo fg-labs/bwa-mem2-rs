@@ -22,32 +22,7 @@
 #include "bwa.h"
 #include "bwamem.h"
 #include "FMI_search.h"
-
-/* bwamem.h has a stale 7-parameter declaration of mem_kernel1_core that
- * does not match the 9-parameter definition in bwamem.cpp (which is what
- * the linker exports). mem_kernel2_core is not declared in the header at
- * all. Override with the actual signatures. */
-int mem_kernel1_core(FMI_search *fmi, const mem_opt_t *opt,
-                     bseq1_t *seq_, int nseq,
-                     mem_chain_v *chain_ar,
-                     mem_seed_t *seedBuf, int64_t seedBufSize,
-                     mem_cache *mmc, int tid);
-
-int mem_kernel2_core(FMI_search *fmi, const mem_opt_t *opt,
-                     bseq1_t *seq_, mem_alnreg_v *regs, int nseq,
-                     mem_chain_v *chain_ar, mem_cache *mmc,
-                     uint8_t *ref_string, int tid);
-
-/* mem_matesw has C++ linkage (declared in bwamem.h outside extern "C"). */
-int mem_matesw(const mem_opt_t *, const bntseq_t *, const uint8_t *,
-               const mem_pestat_t [4], const mem_alnreg_t *,
-               int, const uint8_t *, mem_alnreg_v *);
-
-/* bwa-mem2's profiling globals are declared `extern` across many TUs but
- * defined only in main.cpp (which we exclude). Provide definitions here. */
-uint64_t proc_freq = 0;
-uint64_t tprof[LIM_R][LIM_C] = {{0}};
-uint64_t prof[LIM_R] = {0};
+#include "fastmap.h"    /* worker_alloc / worker_free */
 
 extern "C" {
 
@@ -107,68 +82,6 @@ int64_t shim_align_idx_contig_len(void *fmi, size_t i) {
 }
 
 /* ------------------ Helpers ------------------ */
-
-/* Allocate the worker_t + per-thread scratch for one tid=0 batch.
- * Pared-down copy of fastmap.cpp:memoryAlloc. */
-static int alloc_worker(worker_t &w, mem_opt_t *opt, int nreads) {
-    memset(&w, 0, sizeof(worker_t));
-    w.opt = opt;
-    w.nthreads = 1;
-    w.nreads = nreads;
-
-    w.regs = (mem_alnreg_v *) calloc(nreads, sizeof(mem_alnreg_v));
-    w.chain_ar = (mem_chain_v *) malloc(nreads * sizeof(mem_chain_v));
-    w.seedBuf = (mem_seed_t *) calloc(nreads * AVG_SEEDS_PER_READ, sizeof(mem_seed_t));
-    if (!w.regs || !w.chain_ar || !w.seedBuf) return -1;
-    w.seedBufSize = BATCH_SIZE * AVG_SEEDS_PER_READ;
-
-    int64_t wsize = (int64_t)BATCH_SIZE * SEEDS_PER_READ;
-    w.mmc.seqBufLeftRef [0*CACHE_LINE] = (uint8_t *)_mm_malloc(wsize * MAX_SEQ_LEN_REF + MAX_LINE_LEN, 64);
-    w.mmc.seqBufLeftQer [0*CACHE_LINE] = (uint8_t *)_mm_malloc(wsize * MAX_SEQ_LEN_QER + MAX_LINE_LEN, 64);
-    w.mmc.seqBufRightRef[0*CACHE_LINE] = (uint8_t *)_mm_malloc(wsize * MAX_SEQ_LEN_REF + MAX_LINE_LEN, 64);
-    w.mmc.seqBufRightQer[0*CACHE_LINE] = (uint8_t *)_mm_malloc(wsize * MAX_SEQ_LEN_QER + MAX_LINE_LEN, 64);
-    w.mmc.wsize_buf_ref [0*CACHE_LINE] = wsize * MAX_SEQ_LEN_REF;
-    w.mmc.wsize_buf_qer [0*CACHE_LINE] = wsize * MAX_SEQ_LEN_QER;
-
-    w.mmc.seqPairArrayAux     [0] = (SeqPair *) malloc((wsize + MAX_LINE_LEN) * sizeof(SeqPair));
-    w.mmc.seqPairArrayLeft128 [0] = (SeqPair *) malloc((wsize + MAX_LINE_LEN) * sizeof(SeqPair));
-    w.mmc.seqPairArrayRight128[0] = (SeqPair *) malloc((wsize + MAX_LINE_LEN) * sizeof(SeqPair));
-    w.mmc.wsize[0] = wsize;
-
-    int32_t readLen = READ_LEN;
-    w.mmc.wsize_mem  [0] = (int64_t)BATCH_MUL * BATCH_SIZE * readLen;
-    w.mmc.wsize_mem_s[0] = (int64_t)BATCH_MUL * BATCH_SIZE * readLen;
-    w.mmc.wsize_mem_r[0] = (int64_t)BATCH_MUL * BATCH_SIZE * readLen;
-    w.mmc.matchArray   [0] = (SMEM *)     _mm_malloc(w.mmc.wsize_mem[0] * sizeof(SMEM), 64);
-    w.mmc.min_intv_ar  [0] = (int32_t *)  malloc    (w.mmc.wsize_mem[0] * sizeof(int32_t));
-    w.mmc.query_pos_ar [0] = (int16_t *)  malloc    (w.mmc.wsize_mem[0] * sizeof(int16_t));
-    w.mmc.enc_qdb      [0] = (uint8_t *)  malloc    (w.mmc.wsize_mem[0] * sizeof(uint8_t));
-    w.mmc.rid          [0] = (int32_t *)  malloc    (w.mmc.wsize_mem[0] * sizeof(int32_t));
-    w.mmc.lim          [0] = (int32_t *)  _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
-
-    w.aux = (smem_aux_t **) calloc(1, sizeof(smem_aux_t *));
-    return 0;
-}
-
-static void free_worker(worker_t &w) {
-    if (w.regs)     free(w.regs);
-    if (w.chain_ar) free(w.chain_ar);
-    if (w.seedBuf)  free(w.seedBuf);
-    _mm_free(w.mmc.seqBufLeftRef [0]);
-    _mm_free(w.mmc.seqBufLeftQer [0]);
-    _mm_free(w.mmc.seqBufRightRef[0]);
-    _mm_free(w.mmc.seqBufRightQer[0]);
-    free(w.mmc.seqPairArrayAux    [0]);
-    free(w.mmc.seqPairArrayLeft128[0]);
-    free(w.mmc.seqPairArrayRight128[0]);
-    _mm_free(w.mmc.matchArray  [0]);
-    free(w.mmc.min_intv_ar [0]);
-    free(w.mmc.query_pos_ar[0]);
-    free(w.mmc.enc_qdb     [0]);
-    free(w.mmc.rid         [0]);
-    _mm_free(w.mmc.lim     [0]);
-    free(w.aux);
-}
 
 static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs) {
     int nseqs = (int)(2 * n_pairs);
@@ -570,11 +483,13 @@ ShimSeeds *shim_seed_batch(void *fmi_opaque, mem_opt_t *opts,
     opts->n_threads = 1;
     opts->flag |= MEM_F_PE;
 
-    if (alloc_worker(s->w, opts, s->n_seqs) != 0) {
-        free_seqs(s->seqs, s->n_seqs);
-        free(s);
-        return nullptr;
-    }
+    /* Allocate per-worker scratch using upstream's public helper so our
+     * layout stays in sync with the main bwa-mem2 pipeline. Sets w.nthreads
+     * internally and asserts on bad input / OOM; we fill in the non-scratch
+     * fields afterward. */
+    worker_alloc(opts, s->w, s->n_seqs, 1);
+    s->w.opt = opts;
+    s->w.nreads = s->n_seqs;
     s->w.fmi = fmi;
     s->w.seqs = s->seqs;
     s->w.n_processed = 0;
@@ -612,7 +527,7 @@ void shim_seeds_free(ShimSeeds *s) {
     }
     free_seqs(s->seqs, s->n_seqs);
     _mm_free(s->ref_string);
-    free_worker(s->w);
+    worker_free(s->w, 1);
     free(s);
 }
 
@@ -654,25 +569,16 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
                           mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                           bseq1_t *s, mem_alnreg_v *a, const mem_pestat_t pes[4])
 {
-
-    /* Mate rescue first — mem_matesw can append new mem_alnreg_t entries to
-     * a[!k], so downstream sort+mark-primary must see the post-rescue array. */
-    if (!(opt->flag & MEM_F_NO_RESCUE)) {
-        for (int k = 0; k < 2; ++k) {
-            for (int j = 0; j < a[k].n && j < opt->max_matesw; ++j) {
-                mem_matesw(opt, bns, pac, pes, &a[k].a[j],
-                           s[!k].l_seq, (const uint8_t *)s[!k].seq, &a[!k]);
-            }
-        }
-    }
-
-    int n_pri[2];
-    n_pri[0] = mem_mark_primary_se(opt, a[0].n, a[0].a, (int64_t)pair_idx << 1 | 0);
-    n_pri[1] = mem_mark_primary_se(opt, a[1].n, a[1].a, (int64_t)pair_idx << 1 | 1);
-    if (opt->flag & MEM_F_PRIMARY5) {
-        mem_reorder_primary5(opt->T, &a[0]);
-        mem_reorder_primary5(opt->T, &a[1]);
-    }
+    /* Run upstream's full pairing decision: mate-rescue SW + mem_mark_primary_se
+     * + optional MEM_F_PRIMARY5 reorder + mem_pair + is_multi + q_pe/q_se +
+     * secondary<->primary switch. All verbatim from the bwa-mem2 pipeline — this
+     * replaces the shim's previously hand-rolled composition. On the paired
+     * branch extra_flag already includes 0x2 (if the paired alignment was
+     * preferred); on the no_pairing branch we OR it in below after running
+     * mem_infer_dir ourselves, matching mem_sam_pe's no_pairing block. */
+    int n_pri[2], z[2], q_se[2], extra_flag = 0, paired = 0;
+    mem_pair_resolve(opt, bns, pac, pes, (uint64_t)pair_idx,
+                     s, a, n_pri, z, q_se, &extra_flag, &paired);
 
     /* Convert each side's regions to mem_aln_t arrays for emission. */
     mem_aln_t *lists[2] = {nullptr, nullptr};
@@ -718,38 +624,52 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
         }
     }
 
-    /* Properly-paired flag (0x2). Mirror mem_sam_pe's `no_pairing` fallback:
-     * look at the top region per side, infer direction + distance, and if
-     * the direction's pes stats are valid and the distance is in-band,
-     * flag both sides' primary (first) records as proper pairs.
-     *
-     * This covers the common case (std=0 → mem_pair's internal NaN math
-     * makes it return 0 even for valid pairs). When real variance is
-     * present, mem_pair's score-based selection would do better, but it's
-     * also always applied alongside the infer_dir check in upstream, so
-     * mirroring the infer_dir branch alone is enough to achieve parity
-     * with `bwa-mem2 mem` on properly-paired data. */
-    if ((opt->flag & MEM_F_PE) && !(opt->flag & MEM_F_NOPAIRING)
+    /* No-pairing branch 0x2 decision (mirrors mem_sam_pe's post-resolve block):
+     * when mem_pair_resolve didn't take the paired branch, check the top
+     * region of each side via mem_infer_dir and OR 0x2 into extra_flag if
+     * the inferred distance falls within pes[dir].low..high. */
+    if (!paired && (opt->flag & MEM_F_PE) && !(opt->flag & MEM_F_NOPAIRING)
+        && a[0].n > 0 && a[1].n > 0
         && n_lists[0] > 0 && n_lists[1] > 0
-        && lists[0][0].rid >= 0 && lists[1][0].rid >= 0
-        && lists[0][0].rid == lists[1][0].rid
-        && a[0].n > 0 && a[1].n > 0) {
-        int64_t b1 = a[0].a[0].rb, b2 = a[1].a[0].rb;
-        int64_t l_pac = bns->l_pac;
-        int r1 = (b1 >= l_pac), r2 = (b2 >= l_pac);
-        int64_t p2 = (r1 == r2) ? b2 : (l_pac << 1) - 1 - b2;
-        int64_t dist = p2 > b1 ? p2 - b1 : b1 - p2;
-        int dir = ((r1 == r2) ? 0 : 1) ^ ((p2 > b1) ? 0 : 3);
+        && lists[0][0].rid >= 0 && lists[0][0].rid == lists[1][0].rid) {
+        int64_t dist;
+        int dir = mem_infer_dir(bns->l_pac, a[0].a[0].rb, a[1].a[0].rb, &dist);
         if (!pes[dir].failed && dist >= pes[dir].low && dist <= pes[dir].high) {
-            lists[0][0].flag |= 0x2;
-            lists[1][0].flag |= 0x2;
+            extra_flag |= 0x2;
+        }
+    }
+
+    /* Apply extra_flag (0x1 paired + optional 0x2 proper-pair) to every
+     * emitted record, matching mem_reg2sam's behavior in the no_pairing
+     * branch. On the paired branch this over-applies 0x2 to non-primary
+     * records relative to mem_sam_pe's stricter primary-only application;
+     * that matches how downstream tools treat 0x2 as a pair-level flag. */
+    for (int k = 0; k < 2; ++k) {
+        for (int j = 0; j < n_lists[k]; ++j) {
+            lists[k][j].flag |= extra_flag;
+        }
+    }
+
+    /* On the paired branch, apply the q_se mapq to the chosen primary
+     * (mirrors `h[i].mapq = q_se[i]` in mem_sam_pe's paired emission). */
+    if (paired) {
+        for (int k = 0; k < 2; ++k) {
+            if ((int)a[k].n > 0 && z[k] < n_lists[k]) {
+                lists[k][z[k]].mapq = q_se[k];
+            }
         }
     }
 
     /* Emit records. For each side k, emit all n_lists[k] entries; pair mate
-     * is the primary (index 0) of the other side. */
+     * is the paired-selected primary of the other side (z[!k] on the paired
+     * branch, 0 otherwise — matching bwamem_pair.cpp:545-556's use of
+     * &a[!i].a[z[!i]] as the mate anchor). Without this the paired branch
+     * would use lists[!k][0] even when mem_pair_resolve picked a non-zero
+     * primary, driving RNEXT/PNEXT/TLEN/MC off the wrong mate alignment. */
     for (int k = 0; k < 2; ++k) {
-        mem_aln_t *mate = (n_lists[!k] > 0) ? &lists[!k][0] : nullptr;
+        int mate_idx = 0;
+        if (paired && z[!k] >= 0 && z[!k] < n_lists[!k]) mate_idx = z[!k];
+        mem_aln_t *mate = (n_lists[!k] > 0) ? &lists[!k][mate_idx] : nullptr;
         for (int j = 0; j < n_lists[k]; ++j) {
             append_bam_record(out, pair_idx, bns, &s[k],
                               &lists[k][j], n_lists[k], lists[k], j, mate);
