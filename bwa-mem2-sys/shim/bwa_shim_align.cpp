@@ -23,31 +23,14 @@
 #include "bwamem.h"
 #include "FMI_search.h"
 
-/* bwamem.h has a stale 7-parameter declaration of mem_kernel1_core that
- * does not match the 9-parameter definition in bwamem.cpp (which is what
- * the linker exports). mem_kernel2_core is not declared in the header at
- * all. Override with the actual signatures. */
-int mem_kernel1_core(FMI_search *fmi, const mem_opt_t *opt,
-                     bseq1_t *seq_, int nseq,
-                     mem_chain_v *chain_ar,
-                     mem_seed_t *seedBuf, int64_t seedBufSize,
-                     mem_cache *mmc, int tid);
-
-int mem_kernel2_core(FMI_search *fmi, const mem_opt_t *opt,
-                     bseq1_t *seq_, mem_alnreg_v *regs, int nseq,
-                     mem_chain_v *chain_ar, mem_cache *mmc,
-                     uint8_t *ref_string, int tid);
-
-/* mem_matesw has C++ linkage (declared in bwamem.h outside extern "C"). */
+/* mem_matesw has C++ linkage and is not declared in bwamem.h, so the shim
+ * carries a forward decl (outside the extern "C" block so the C++ mangled
+ * name matches). The mem_kernel{1,2}_core decls previously also lived here
+ * — they now come from bwamem.h (upstream PR #5). Profiling globals are
+ * now shipped in libbwa-mem2.a via profiling.cpp (upstream PR #7). */
 int mem_matesw(const mem_opt_t *, const bntseq_t *, const uint8_t *,
                const mem_pestat_t [4], const mem_alnreg_t *,
                int, const uint8_t *, mem_alnreg_v *);
-
-/* bwa-mem2's profiling globals are declared `extern` across many TUs but
- * defined only in main.cpp (which we exclude). Provide definitions here. */
-uint64_t proc_freq = 0;
-uint64_t tprof[LIM_R][LIM_C] = {{0}};
-uint64_t prof[LIM_R] = {0};
 
 extern "C" {
 
