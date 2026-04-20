@@ -655,15 +655,8 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
                           bseq1_t *s, mem_alnreg_v *a, const mem_pestat_t pes[4])
 {
 
-    int n_pri[2];
-    n_pri[0] = mem_mark_primary_se(opt, a[0].n, a[0].a, (int64_t)pair_idx << 1 | 0);
-    n_pri[1] = mem_mark_primary_se(opt, a[1].n, a[1].a, (int64_t)pair_idx << 1 | 1);
-    if (opt->flag & MEM_F_PRIMARY5) {
-        mem_reorder_primary5(opt->T, &a[0]);
-        mem_reorder_primary5(opt->T, &a[1]);
-    }
-
-    /* Mate rescue (unless disabled). */
+    /* Mate rescue first — mem_matesw can append new mem_alnreg_t entries to
+     * a[!k], so downstream sort+mark-primary must see the post-rescue array. */
     if (!(opt->flag & MEM_F_NO_RESCUE)) {
         for (int k = 0; k < 2; ++k) {
             for (int j = 0; j < a[k].n && j < opt->max_matesw; ++j) {
@@ -671,6 +664,14 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
                            s[!k].l_seq, (const uint8_t *)s[!k].seq, &a[!k]);
             }
         }
+    }
+
+    int n_pri[2];
+    n_pri[0] = mem_mark_primary_se(opt, a[0].n, a[0].a, (int64_t)pair_idx << 1 | 0);
+    n_pri[1] = mem_mark_primary_se(opt, a[1].n, a[1].a, (int64_t)pair_idx << 1 | 1);
+    if (opt->flag & MEM_F_PRIMARY5) {
+        mem_reorder_primary5(opt->T, &a[0]);
+        mem_reorder_primary5(opt->T, &a[1]);
     }
 
     /* Convert each side's regions to mem_aln_t arrays for emission. */
@@ -699,8 +700,7 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
         }
     }
 
-    /* Set paired-end flags on the primary record. Based on mem_aln2sam's
-     * flag-propagation; simplified to cover the common case. */
+    /* Set paired-end flags per mem_aln2sam's flag-propagation rules. */
     for (int k = 0; k < 2; ++k) {
         for (int j = 0; j < n_lists[k]; ++j) {
             mem_aln_t *p = &lists[k][j];
@@ -713,7 +713,36 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
                     p->flag |= 0x8;                            /* mate unmapped */
                 }
                 if (p->rid < 0) p->flag |= 0x4;                /* self unmapped */
+                if (p->is_rev)  p->flag |= 0x10;               /* self reverse  */
             }
+        }
+    }
+
+    /* Properly-paired flag (0x2). Mirror mem_sam_pe's `no_pairing` fallback:
+     * look at the top region per side, infer direction + distance, and if
+     * the direction's pes stats are valid and the distance is in-band,
+     * flag both sides' primary (first) records as proper pairs.
+     *
+     * This covers the common case (std=0 → mem_pair's internal NaN math
+     * makes it return 0 even for valid pairs). When real variance is
+     * present, mem_pair's score-based selection would do better, but it's
+     * also always applied alongside the infer_dir check in upstream, so
+     * mirroring the infer_dir branch alone is enough to achieve parity
+     * with `bwa-mem2 mem` on properly-paired data. */
+    if ((opt->flag & MEM_F_PE) && !(opt->flag & MEM_F_NOPAIRING)
+        && n_lists[0] > 0 && n_lists[1] > 0
+        && lists[0][0].rid >= 0 && lists[1][0].rid >= 0
+        && lists[0][0].rid == lists[1][0].rid
+        && a[0].n > 0 && a[1].n > 0) {
+        int64_t b1 = a[0].a[0].rb, b2 = a[1].a[0].rb;
+        int64_t l_pac = bns->l_pac;
+        int r1 = (b1 >= l_pac), r2 = (b2 >= l_pac);
+        int64_t p2 = (r1 == r2) ? b2 : (l_pac << 1) - 1 - b2;
+        int64_t dist = p2 > b1 ? p2 - b1 : b1 - p2;
+        int dir = ((r1 == r2) ? 0 : 1) ^ ((p2 > b1) ? 0 : 3);
+        if (!pes[dir].failed && dist >= pes[dir].low && dist <= pes[dir].high) {
+            lists[0][0].flag |= 0x2;
+            lists[1][0].flag |= 0x2;
         }
     }
 
