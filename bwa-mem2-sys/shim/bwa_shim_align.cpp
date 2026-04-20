@@ -46,15 +46,28 @@ struct ShimAlignOutput {
     mem_pestat_t pes[4];
 };
 
-/* Phase-1 state carried into extend_batch. Owns worker, seqs, and ref_string.
- * extend_batch (or estimate_pestat) frees it. */
+/* Phase-1 state carried into extend_batch. Owns worker and seqs; borrows
+ * ref_string from the index handle. extend_batch (or estimate_pestat) frees
+ * the owned pieces. */
 struct ShimSeeds {
     worker_t w;
     bseq1_t *seqs;
     int      n_seqs;
     mem_opt_t *opts;
     FMI_search *fmi;
-    uint8_t *ref_string;
+    uint8_t *ref_string;  /* borrowed from BwaShimIndex; not freed here */
+};
+
+/* Index handle: owns the loaded FMI_search plus the one-time-unpacked
+ * 2*l_pac reference string used by mem_chain2aln_across_reads_V2. The
+ * ref_string is built once at load time so every seed_batch borrows it
+ * instead of rebuilding (~6GB alloc + full pass over packed ref per call
+ * on hs38). Forward declaration of build_ref_string below. */
+static uint8_t *build_ref_string(const bntseq_t *bns, const uint8_t *pac);
+
+struct BwaShimIndex {
+    FMI_search *fmi;
+    uint8_t    *ref_string;
 };
 
 /* ------------------ Index ------------------ */
@@ -62,23 +75,39 @@ struct ShimSeeds {
 void *shim_align_idx_load(const char *prefix) {
     FMI_search *fmi = new FMI_search(prefix);
     fmi->load_index();
-    return static_cast<void *>(fmi);
+    BwaShimIndex *idx = (BwaShimIndex *) calloc(1, sizeof(BwaShimIndex));
+    if (!idx) {
+        delete fmi;
+        return nullptr;
+    }
+    idx->fmi = fmi;
+    idx->ref_string = build_ref_string(fmi->idx->bns, fmi->idx->pac);
+    if (!idx->ref_string) {
+        delete idx->fmi;
+        free(idx);
+        return nullptr;
+    }
+    return static_cast<void *>(idx);
 }
 
-void shim_align_idx_free(void *fmi) {
-    delete static_cast<FMI_search *>(fmi);
+void shim_align_idx_free(void *opaque) {
+    if (!opaque) return;
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(opaque);
+    if (idx->ref_string) _mm_free(idx->ref_string);
+    delete idx->fmi;
+    free(idx);
 }
 
-size_t shim_align_idx_n_contigs(void *fmi) {
-    return (size_t) static_cast<FMI_search *>(fmi)->idx->bns->n_seqs;
+size_t shim_align_idx_n_contigs(void *opaque) {
+    return (size_t) static_cast<BwaShimIndex *>(opaque)->fmi->idx->bns->n_seqs;
 }
 
-const char *shim_align_idx_contig_name(void *fmi, size_t i) {
-    return static_cast<FMI_search *>(fmi)->idx->bns->anns[i].name;
+const char *shim_align_idx_contig_name(void *opaque, size_t i) {
+    return static_cast<BwaShimIndex *>(opaque)->fmi->idx->bns->anns[i].name;
 }
 
-int64_t shim_align_idx_contig_len(void *fmi, size_t i) {
-    return static_cast<FMI_search *>(fmi)->idx->bns->anns[i].len;
+int64_t shim_align_idx_contig_len(void *opaque, size_t i) {
+    return static_cast<BwaShimIndex *>(opaque)->fmi->idx->bns->anns[i].len;
 }
 
 /* ------------------ Helpers ------------------ */
@@ -466,11 +495,12 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
 
 /* ------------------ Phase 1: seed_batch ------------------ */
 
-ShimSeeds *shim_seed_batch(void *fmi_opaque, mem_opt_t *opts,
+ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
                            const ShimReadPair *pairs, size_t n_pairs)
 {
-    if (!fmi_opaque || !opts) return nullptr;
-    FMI_search *fmi = static_cast<FMI_search *>(fmi_opaque);
+    if (!idx_opaque || !opts) return nullptr;
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
+    FMI_search *fmi = idx->fmi;
 
     ShimSeeds *s = (ShimSeeds *) calloc(1, sizeof(ShimSeeds));
     s->opts = opts;
@@ -495,8 +525,9 @@ ShimSeeds *shim_seed_batch(void *fmi_opaque, mem_opt_t *opts,
     s->w.n_processed = 0;
     s->w.pes = nullptr;
 
-    /* Build the unpacked reference string used by mem_chain2aln_across_reads_V2. */
-    s->ref_string = build_ref_string(fmi->idx->bns, fmi->idx->pac);
+    /* Borrow the unpacked reference string from the index handle
+     * (built once at load time; see BwaShimIndex / shim_align_idx_load). */
+    s->ref_string = idx->ref_string;
 
     /* Seed in BATCH_SIZE chunks by calling mem_kernel1_core directly. */
     int memSize = s->n_seqs;
@@ -526,7 +557,7 @@ void shim_seeds_free(ShimSeeds *s) {
          * w.seedBuf which alloc_worker owns. No extra freeing needed here. */
     }
     free_seqs(s->seqs, s->n_seqs);
-    _mm_free(s->ref_string);
+    /* s->ref_string is borrowed from BwaShimIndex; do not free. */
     worker_free(s->w, 1);
     free(s);
 }
@@ -686,12 +717,12 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
     }
 }
 
-ShimAlignOutput *shim_extend_batch(void *fmi_opaque, ShimSeeds *s,
+ShimAlignOutput *shim_extend_batch(void *idx_opaque, ShimSeeds *s,
                                    const mem_pestat_t *pestat_in)
 {
     if (!s) return nullptr;
-    FMI_search *fmi = static_cast<FMI_search *>(fmi_opaque);
-    if (!fmi) fmi = s->fmi;
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
+    FMI_search *fmi = idx ? idx->fmi : s->fmi;
 
     mem_opt_t *opt = s->opts;
     const bntseq_t *bns = fmi->idx->bns;
@@ -727,24 +758,24 @@ ShimAlignOutput *shim_extend_batch(void *fmi_opaque, ShimSeeds *s,
 
 /* ------------------ Convenience: align_batch ------------------ */
 
-ShimAlignOutput *shim_align_batch(void *fmi_opaque, mem_opt_t *opts,
+ShimAlignOutput *shim_align_batch(void *idx_opaque, mem_opt_t *opts,
                                   const ShimReadPair *pairs, size_t n_pairs,
                                   const mem_pestat_t *pestat_in)
 {
-    ShimSeeds *s = shim_seed_batch(fmi_opaque, opts, pairs, n_pairs);
+    ShimSeeds *s = shim_seed_batch(idx_opaque, opts, pairs, n_pairs);
     if (!s) return nullptr;
-    return shim_extend_batch(fmi_opaque, s, pestat_in);
+    return shim_extend_batch(idx_opaque, s, pestat_in);
 }
 
 /* ------------------ estimate_pestat ------------------ */
 
-int shim_estimate_pestat(void *fmi_opaque, mem_opt_t *opts,
+int shim_estimate_pestat(void *idx_opaque, mem_opt_t *opts,
                          const ShimReadPair *pairs, size_t n_pairs,
                          mem_pestat_t *pestat_out)
 {
-    ShimSeeds *s = shim_seed_batch(fmi_opaque, opts, pairs, n_pairs);
+    ShimSeeds *s = shim_seed_batch(idx_opaque, opts, pairs, n_pairs);
     if (!s) return -1;
-    FMI_search *fmi = static_cast<FMI_search *>(fmi_opaque);
+    FMI_search *fmi = s->fmi;
     run_se_extension(s);
     mem_pestat(opts, fmi->idx->bns->l_pac, s->n_seqs, s->w.regs, pestat_out);
     for (int i = 0; i < s->n_seqs; ++i) free(s->w.regs[i].a);
