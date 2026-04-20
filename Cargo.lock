@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem2-rs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bwa-mem2-sys",
  "libc",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem2-rs-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bwa-mem2-rs",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem2-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bindgen",
  "cc",
