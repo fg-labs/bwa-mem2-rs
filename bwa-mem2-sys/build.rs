@@ -115,10 +115,12 @@ fn main() {
 
     let skip: &[&str] = &[
         "main.cpp",     // CLI entry point
-        "fastmap.cpp",  // CLI-side batch driver; future shim drives its own
         "bwtindex.cpp", // index builder; out of scope (users run bwa-mem2 index)
         "runsimd.cpp",  // runtime SIMD-dispatch launcher; has unguarded main()
     ];
+    // fastmap.cpp used to be excluded (CLI-side batch driver) but is now
+    // built to expose worker_alloc/worker_free. Its entry point is
+    // `main_mem`, not `main`, so no collision with the Rust test harness.
     for entry in fs::read_dir(&vendor_src).unwrap() {
         let e = entry.unwrap();
         let name = e.file_name().to_string_lossy().into_owned();

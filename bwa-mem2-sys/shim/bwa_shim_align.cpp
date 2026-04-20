@@ -22,6 +22,7 @@
 #include "bwa.h"
 #include "bwamem.h"
 #include "FMI_search.h"
+#include "fastmap.h"    /* worker_alloc / worker_free */
 
 /* mem_matesw has C++ linkage and is not declared in bwamem.h, so the shim
  * carries a forward decl (outside the extern "C" block so the C++ mangled
@@ -90,68 +91,6 @@ int64_t shim_align_idx_contig_len(void *fmi, size_t i) {
 }
 
 /* ------------------ Helpers ------------------ */
-
-/* Allocate the worker_t + per-thread scratch for one tid=0 batch.
- * Pared-down copy of fastmap.cpp:memoryAlloc. */
-static int alloc_worker(worker_t &w, mem_opt_t *opt, int nreads) {
-    memset(&w, 0, sizeof(worker_t));
-    w.opt = opt;
-    w.nthreads = 1;
-    w.nreads = nreads;
-
-    w.regs = (mem_alnreg_v *) calloc(nreads, sizeof(mem_alnreg_v));
-    w.chain_ar = (mem_chain_v *) malloc(nreads * sizeof(mem_chain_v));
-    w.seedBuf = (mem_seed_t *) calloc(nreads * AVG_SEEDS_PER_READ, sizeof(mem_seed_t));
-    if (!w.regs || !w.chain_ar || !w.seedBuf) return -1;
-    w.seedBufSize = BATCH_SIZE * AVG_SEEDS_PER_READ;
-
-    int64_t wsize = (int64_t)BATCH_SIZE * SEEDS_PER_READ;
-    w.mmc.seqBufLeftRef [0*CACHE_LINE] = (uint8_t *)_mm_malloc(wsize * MAX_SEQ_LEN_REF + MAX_LINE_LEN, 64);
-    w.mmc.seqBufLeftQer [0*CACHE_LINE] = (uint8_t *)_mm_malloc(wsize * MAX_SEQ_LEN_QER + MAX_LINE_LEN, 64);
-    w.mmc.seqBufRightRef[0*CACHE_LINE] = (uint8_t *)_mm_malloc(wsize * MAX_SEQ_LEN_REF + MAX_LINE_LEN, 64);
-    w.mmc.seqBufRightQer[0*CACHE_LINE] = (uint8_t *)_mm_malloc(wsize * MAX_SEQ_LEN_QER + MAX_LINE_LEN, 64);
-    w.mmc.wsize_buf_ref [0*CACHE_LINE] = wsize * MAX_SEQ_LEN_REF;
-    w.mmc.wsize_buf_qer [0*CACHE_LINE] = wsize * MAX_SEQ_LEN_QER;
-
-    w.mmc.seqPairArrayAux     [0] = (SeqPair *) malloc((wsize + MAX_LINE_LEN) * sizeof(SeqPair));
-    w.mmc.seqPairArrayLeft128 [0] = (SeqPair *) malloc((wsize + MAX_LINE_LEN) * sizeof(SeqPair));
-    w.mmc.seqPairArrayRight128[0] = (SeqPair *) malloc((wsize + MAX_LINE_LEN) * sizeof(SeqPair));
-    w.mmc.wsize[0] = wsize;
-
-    int32_t readLen = READ_LEN;
-    w.mmc.wsize_mem  [0] = (int64_t)BATCH_MUL * BATCH_SIZE * readLen;
-    w.mmc.wsize_mem_s[0] = (int64_t)BATCH_MUL * BATCH_SIZE * readLen;
-    w.mmc.wsize_mem_r[0] = (int64_t)BATCH_MUL * BATCH_SIZE * readLen;
-    w.mmc.matchArray   [0] = (SMEM *)     _mm_malloc(w.mmc.wsize_mem[0] * sizeof(SMEM), 64);
-    w.mmc.min_intv_ar  [0] = (int32_t *)  malloc    (w.mmc.wsize_mem[0] * sizeof(int32_t));
-    w.mmc.query_pos_ar [0] = (int16_t *)  malloc    (w.mmc.wsize_mem[0] * sizeof(int16_t));
-    w.mmc.enc_qdb      [0] = (uint8_t *)  malloc    (w.mmc.wsize_mem[0] * sizeof(uint8_t));
-    w.mmc.rid          [0] = (int32_t *)  malloc    (w.mmc.wsize_mem[0] * sizeof(int32_t));
-    w.mmc.lim          [0] = (int32_t *)  _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
-
-    w.aux = (smem_aux_t **) calloc(1, sizeof(smem_aux_t *));
-    return 0;
-}
-
-static void free_worker(worker_t &w) {
-    if (w.regs)     free(w.regs);
-    if (w.chain_ar) free(w.chain_ar);
-    if (w.seedBuf)  free(w.seedBuf);
-    _mm_free(w.mmc.seqBufLeftRef [0]);
-    _mm_free(w.mmc.seqBufLeftQer [0]);
-    _mm_free(w.mmc.seqBufRightRef[0]);
-    _mm_free(w.mmc.seqBufRightQer[0]);
-    free(w.mmc.seqPairArrayAux    [0]);
-    free(w.mmc.seqPairArrayLeft128[0]);
-    free(w.mmc.seqPairArrayRight128[0]);
-    _mm_free(w.mmc.matchArray  [0]);
-    free(w.mmc.min_intv_ar [0]);
-    free(w.mmc.query_pos_ar[0]);
-    free(w.mmc.enc_qdb     [0]);
-    free(w.mmc.rid         [0]);
-    _mm_free(w.mmc.lim     [0]);
-    free(w.aux);
-}
 
 static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs) {
     int nseqs = (int)(2 * n_pairs);
@@ -553,11 +492,13 @@ ShimSeeds *shim_seed_batch(void *fmi_opaque, mem_opt_t *opts,
     opts->n_threads = 1;
     opts->flag |= MEM_F_PE;
 
-    if (alloc_worker(s->w, opts, s->n_seqs) != 0) {
-        free_seqs(s->seqs, s->n_seqs);
-        free(s);
-        return nullptr;
-    }
+    /* Allocate per-worker scratch using upstream's public helper so our
+     * layout stays in sync with the main bwa-mem2 pipeline. Sets w.nthreads
+     * internally and asserts on bad input / OOM; we fill in the non-scratch
+     * fields afterward. */
+    worker_alloc(opts, s->w, s->n_seqs, 1);
+    s->w.opt = opts;
+    s->w.nreads = s->n_seqs;
     s->w.fmi = fmi;
     s->w.seqs = s->seqs;
     s->w.n_processed = 0;
@@ -595,7 +536,7 @@ void shim_seeds_free(ShimSeeds *s) {
     }
     free_seqs(s->seqs, s->n_seqs);
     _mm_free(s->ref_string);
-    free_worker(s->w);
+    worker_free(s->w, 1);
     free(s);
 }
 
