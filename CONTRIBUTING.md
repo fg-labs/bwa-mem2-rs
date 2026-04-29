@@ -1,4 +1,4 @@
-# Contributing to bwa-mem2-rs
+# Contributing to bwa-mem3-rs
 
 ## Development setup
 
@@ -7,9 +7,9 @@
 - Rust (stable toolchain — see `rust-toolchain.toml` for the pinned version).
 - A C++17 compiler (clang on macOS, gcc on Linux).
 - `zlib` development headers (`zlib1g-dev` on Debian/Ubuntu; included on macOS).
-- For integration tests: a prebuilt bwa-mem2 index — set `BWA_MEM2_RS_TEST_REF`
+- For integration tests: a prebuilt bwa-mem3 index — set `BWA_MEM3_RS_TEST_REF`
   to its prefix (the path such that `<prefix>.bwt.2bit.64` exists). Build one
-  with `bwa-mem2 index <ref.fa>`.
+  with `bwa-mem3 index <ref.fa>`.
 
 ### Install git hooks
 
@@ -37,26 +37,26 @@ cargo ci-fmt && cargo ci-lint && cargo ci-build && cargo ci-test
 ### Run integration tests against a real index
 
 ```bash
-BWA_MEM2_RS_TEST_REF=/path/to/hg38.fa cargo test --workspace
+BWA_MEM3_RS_TEST_REF=/path/to/hg38.fa cargo test --workspace
 ```
 
-Without `BWA_MEM2_RS_TEST_REF` the integration tests skip gracefully.
+Without `BWA_MEM3_RS_TEST_REF` the integration tests skip gracefully.
 
 ### End-to-end regression
 
-`bwa-mem2-rs-cli` ships a `tests/e2e.rs` test that embeds PhiX174, builds an
-index via `bwa-mem2 index`, simulates 1,000 paired reads, runs our `bwa-rs`
+`bwa-mem3-rs-cli` ships a `tests/e2e.rs` test that embeds PhiX174, builds an
+index via `bwa-mem3 index`, simulates 1,000 paired reads, runs our `bwa-rs`
 CLI, and verifies the output via `samtools quickcheck` + `samtools view -c`.
-Runs in CI when `bwa-mem2` + `samtools` are available; locally set
-`BWA_MEM2_BIN=/path/to/bwa-mem2` if the CLI is not on `PATH`.
+Runs in CI when `bwa-mem3` + `samtools` are available; locally set
+`BWA_MEM3_BIN=/path/to/bwa-mem3` if the CLI is not on `PATH`.
 
 ### CLI-parity test (optional)
 
-The `cli_parity` test compares our packed-BAM output against `bwa-mem2 mem`
+The `cli_parity` test compares our packed-BAM output against `bwa-mem3 mem`
 CLI output. It requires:
 
-- `BWA_MEM2_BIN=/path/to/bwa-mem2`
-- `BWA_MEM2_RS_TEST_REF=/path/to/index/prefix`
+- `BWA_MEM3_BIN=/path/to/bwa-mem3`
+- `BWA_MEM3_RS_TEST_REF=/path/to/index/prefix`
 - `samtools` on `PATH`
 
 ## Code style
@@ -67,7 +67,7 @@ CLI output. It requires:
   every `unsafe impl Send/Sync` and unsafe block must carry a safety comment
   naming the invariant it relies on (e.g. "BwaIndex has no mutable state after
   load" or "Seeds owns all memory; no aliasing back into shared state").
-- Errors return `Result<_, bwa_mem2_rs::Error>`; no panics across the FFI
+- Errors return `Result<_, bwa_mem3_rs::Error>`; no panics across the FFI
   boundary.
 - Clippy runs with `-D warnings`.
 
@@ -80,10 +80,10 @@ CLI output. It requires:
 - Branch names: `JIRA-1234/initials_short-description` or similar.
 - Never commit directly to `main`.
 
-## Updating the vendored `bwa-mem2` source
+## Updating the vendored `bwa-mem3` source
 
-The crate vendors a snapshot of [`fg-labs/bwa-mem2`](https://github.com/fg-labs/bwa-mem2)
-at the `fg-main` branch under `bwa-mem2-sys/vendor/bwa-mem2/`. `fg-main` is
+The crate vendors a snapshot of [`fg-labs/bwa-mem3`](https://github.com/fg-labs/bwa-mem3)
+at the `main` branch under `bwa-mem3-sys/vendor/bwa-mem3/`. `main` is
 our integration branch tracking upstream `bwa-mem2/bwa-mem2` with:
 
 - Apple Silicon / NEON hot-path kernels (PR #288 equivalent).
@@ -93,10 +93,10 @@ our integration branch tracking upstream `bwa-mem2/bwa-mem2` with:
   collides with libc on macOS).
 - Future: bwa-meth support, XB tag, etc.
 
-To refresh the vendored snapshot to a new `fg-main` tip:
+To refresh the vendored snapshot to a new `main` tip:
 
 ```bash
-scripts/refresh-bwa-mem2.sh <commit-hash> [local-source-path]
+scripts/refresh-bwa-mem3.sh <commit-hash> [local-source-path]
 ```
 
 The script:

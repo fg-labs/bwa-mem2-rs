@@ -1,19 +1,19 @@
-# bwa-mem2-rs
+# bwa-mem3-rs
 
-[![CI](https://github.com/fg-labs/bwa-mem2-rs/actions/workflows/check.yml/badge.svg)](https://github.com/fg-labs/bwa-mem2-rs/actions/workflows/check.yml)
-[![crates.io: bwa-mem2-rs](https://img.shields.io/crates/v/bwa-mem2-rs.svg?label=bwa-mem2-rs)](https://crates.io/crates/bwa-mem2-rs)
-[![crates.io: bwa-mem2-sys](https://img.shields.io/crates/v/bwa-mem2-sys.svg?label=bwa-mem2-sys)](https://crates.io/crates/bwa-mem2-sys)
-[![crates.io: bwa-mem2-rs-cli](https://img.shields.io/crates/v/bwa-mem2-rs-cli.svg?label=bwa-mem2-rs-cli)](https://crates.io/crates/bwa-mem2-rs-cli)
-[![docs.rs](https://img.shields.io/docsrs/bwa-mem2-rs?label=docs.rs)](https://docs.rs/bwa-mem2-rs)
+[![CI](https://github.com/fg-labs/bwa-mem3-rs/actions/workflows/check.yml/badge.svg)](https://github.com/fg-labs/bwa-mem3-rs/actions/workflows/check.yml)
+[![crates.io: bwa-mem3-rs](https://img.shields.io/crates/v/bwa-mem3-rs.svg?label=bwa-mem3-rs)](https://crates.io/crates/bwa-mem3-rs)
+[![crates.io: bwa-mem3-sys](https://img.shields.io/crates/v/bwa-mem3-sys.svg?label=bwa-mem3-sys)](https://crates.io/crates/bwa-mem3-sys)
+[![crates.io: bwa-mem3-rs-cli](https://img.shields.io/crates/v/bwa-mem3-rs-cli.svg?label=bwa-mem3-rs-cli)](https://crates.io/crates/bwa-mem3-rs-cli)
+[![docs.rs](https://img.shields.io/docsrs/bwa-mem3-rs?label=docs.rs)](https://docs.rs/bwa-mem3-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Rust FFI crate for [bwa-mem2](https://github.com/bwa-mem2/bwa-mem2) with packed-BAM output and caller-owned parallelism.
+Rust FFI crate for [bwa-mem3](https://github.com/fg-labs/bwa-mem3) with packed-BAM output and caller-owned parallelism.
 
-Hosted under [`fg-labs/bwa-mem2-rs`](https://github.com/fg-labs/bwa-mem2-rs); it vendors [`fg-labs/bwa-mem2`](https://github.com/fg-labs/bwa-mem2) at the `fg-main` branch — our integration branch over upstream with Apple Silicon / NEON + Linux-arm64 / CI fixes applied.
+Hosted under [`fg-labs/bwa-mem3-rs`](https://github.com/fg-labs/bwa-mem3-rs); it vendors [`fg-labs/bwa-mem3`](https://github.com/fg-labs/bwa-mem3) at the `main` branch — our integration branch over upstream with Apple Silicon / NEON + Linux-arm64 / CI fixes applied.
 
 ## What it does
 
-- Aligns read pairs via bwa-mem2, returning **packed BAM records** per the BAM spec (ready to stream to any BGZF writer).
+- Aligns read pairs via bwa-mem3, returning **packed BAM records** per the BAM spec (ready to stream to any BGZF writer).
 - Blocking, reentrant, single-threaded per call — **caller drives all parallelism** via rayon, tokio `spawn_blocking`, or any work-stealing pool.
 - Phase-split API: `seed_batch` → `extend_batch` lets work-stealing pools balance seeding and extension independently. `align_batch` is a thin convenience wrapper.
 - Runs on **x86_64** (AVX2 by default) and **aarch64** (Apple Silicon + AWS Graviton).
@@ -21,9 +21,9 @@ Hosted under [`fg-labs/bwa-mem2-rs`](https://github.com/fg-labs/bwa-mem2-rs); it
 ## Quick start
 
 ```rust
-use bwa_mem2_rs::{align_batch, BwaIndex, MemOpts, ReadPair};
+use bwa_mem3_rs::{align_batch, BwaIndex, MemOpts, ReadPair};
 
-let idx = BwaIndex::load("hg38.fa")?;                 // bwa-mem2 index prefix
+let idx = BwaIndex::load("hg38.fa")?;                 // bwa-mem3 index prefix
 let mut opts = MemOpts::new()?;
 opts.set_pe(true);
 
@@ -46,7 +46,7 @@ for record in aln.iter() {
 ## Work-stealing parallelism
 
 ```rust
-use bwa_mem2_rs::*;
+use bwa_mem3_rs::*;
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -64,7 +64,7 @@ The crate itself never spawns threads. Every public function blocks its calling 
 
 ## CLI
 
-The `bwa-mem2-rs-cli` crate ships a minimal `bwa-rs` binary that wraps the library:
+The `bwa-mem3-rs-cli` crate ships a minimal `bwa-rs` binary that wraps the library:
 
 ```
 bwa-rs mem <ref-prefix> <r1.fq[.gz]> <r2.fq[.gz]> [-o out.bam]
@@ -75,20 +75,20 @@ bwa-rs mem <ref-prefix> <r1.fq[.gz]> <r2.fq[.gz]> [-o out.bam]
 Use the upstream CLI to build an index:
 
 ```
-bwa-mem2 index <prefix>.fa
+bwa-mem3 index <prefix>.fa
 ```
 
 Index building is intentionally out-of-scope for this crate.
 
 ## Architecture
 
-- `bwa-mem2-sys` vendors upstream bwa-mem2 sources and compiles them alongside
+- `bwa-mem3-sys` vendors upstream bwa-mem3 sources and compiles them alongside
   our custom C++ shim (`shim/bwa_shim*.cpp`). The shim bridges to upstream's
-  public API via opaque pointers and emits packed BAM directly from bwa-mem2's
+  public API via opaque pointers and emits packed BAM directly from bwa-mem3's
   `mem_aln_t` (no SAM round-trip).
-- `bwa-mem2-rs` wraps the FFI crate in a safe Rust API with `Send`/`Sync`
+- `bwa-mem3-rs` wraps the FFI crate in a safe Rust API with `Send`/`Sync`
   semantics that let callers drive parallelism externally.
-- `bwa-mem2-rs-cli` is a thin `bwa-rs mem` binary.
+- `bwa-mem3-rs-cli` is a thin `bwa-rs mem` binary.
 
 See `CLAUDE.md` for the project-specific gotchas (CIGAR opcode remap, 2-bit
 seq encoding, vendored `MATE_SORT=0` invariant, etc.).
@@ -99,11 +99,11 @@ seq encoding, vendored `MATE_SORT=0` invariant, etc.).
 # Unit tests (no index required)
 cargo test --workspace
 
-# Integration tests (require a bwa-mem2 index prefix)
-BWA_MEM2_RS_TEST_REF=/path/to/hg38.fa cargo test --workspace
+# Integration tests (require a bwa-mem3 index prefix)
+BWA_MEM3_RS_TEST_REF=/path/to/hg38.fa cargo test --workspace
 ```
 
-The end-to-end regression test (PhiX reference + simulated reads + CLI round-trip) runs automatically in CI once `bwa-mem2` and `samtools` are available; locally set `BWA_MEM2_BIN=/path/to/bwa-mem2` if the CLI is not on `PATH`.
+The end-to-end regression test (PhiX reference + simulated reads + CLI round-trip) runs automatically in CI once `bwa-mem3` and `samtools` are available; locally set `BWA_MEM3_BIN=/path/to/bwa-mem3` if the CLI is not on `PATH`.
 
 ## License
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install git pre-commit hook for bwa-mem2-rs.
+# Install git pre-commit hook for bwa-mem3-rs.
 # Usage: ./scripts/install-hooks.sh
 set -euo pipefail
 
@@ -9,7 +9,7 @@ HOOKS_SOURCE="${SCRIPT_DIR}/hooks"
 HOOKS_DEST="${REPO_ROOT}/.git/hooks"
 
 if [[ ! -f "${REPO_ROOT}/Cargo.toml" ]]; then
-    echo "error: must be run from the bwa-mem2-rs repository" >&2
+    echo "error: must be run from the bwa-mem3-rs repository" >&2
     exit 1
 fi
 if [[ ! -d "${REPO_ROOT}/.git" ]]; then

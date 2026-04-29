@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           WORKSPACE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
-            '.packages[] | select(.name == "bwa-mem2-rs") | .version')
+            '.packages[] | select(.name == "bwa-mem3-rs") | .version')
           MISMATCHES=$(cargo metadata --no-deps --format-version 1 | jq -r \
             --arg ver "$WORKSPACE_VERSION" \
             '.packages[] | select(.name | startswith("bwa-")) | select(.version != $ver) | "\(.name) \(.version)"')
@@ -64,10 +64,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
-            '.packages[] | select(.name == "bwa-mem2-rs") | .version')
+            '.packages[] | select(.name == "bwa-mem3-rs") | .version')
           PUBLISHED_VERSION=$(curl -sS \
-            -H "User-Agent: bwa-mem2-rs-ci (https://github.com/fg-labs/bwa-mem2-rs)" \
-            "https://crates.io/api/v1/crates/bwa-mem2-rs" | jq -r \
+            -H "User-Agent: bwa-mem3-rs-ci (https://github.com/fg-labs/bwa-mem3-rs)" \
+            "https://crates.io/api/v1/crates/bwa-mem3-rs" | jq -r \
             '.crate.max_version // "0.0.0"')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -79,13 +79,13 @@ jobs:
 
           # Publish leaves before the root. Update when workspace deps change.
           CRATES=(
-            bwa-mem2-sys
-            bwa-mem2-rs
-            bwa-mem2-rs-cli
+            bwa-mem3-sys
+            bwa-mem3-rs
+            bwa-mem3-rs-cli
           )
           for crate in "${CRATES[@]}"; do
             CRATE_MAX_VERSION=$(curl -sS \
-              -H "User-Agent: bwa-mem2-rs-ci (https://github.com/fg-labs/bwa-mem2-rs)" \
+              -H "User-Agent: bwa-mem3-rs-ci (https://github.com/fg-labs/bwa-mem3-rs)" \
               "https://crates.io/api/v1/crates/${crate}" | jq -r \
               '.crate.max_version // "0.0.0"')
             if [ "$CRATE_MAX_VERSION" = "$VERSION" ]; then

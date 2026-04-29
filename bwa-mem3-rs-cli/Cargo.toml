@@ -1,0 +1,31 @@
+[package]
+name = "bwa-mem3-rs-cli"
+description = "Minimal CLI wrapping bwa-mem3-rs — aligns paired FASTQ to packed BAM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["command-line-utilities", "science"]
+keywords = ["bioinformatics", "bwa", "alignment", "bam"]
+readme = "README.md"
+
+[[bin]]
+name = "bwa-rs"
+path = "src/main.rs"
+
+[dependencies]
+bwa-mem3-rs = { version = "0.1.1", path = "../bwa-mem3-rs" }
+clap = { version = "4", features = ["derive"] }
+noodles-fastq = "0.18"
+noodles-bgzf = "0.42"
+flate2 = "1"
+thiserror = "1"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

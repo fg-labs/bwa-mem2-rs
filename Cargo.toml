@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["bwa-mem2-sys", "bwa-mem2-rs", "bwa-mem2-rs-cli"]
+members = ["bwa-mem3-sys", "bwa-mem3-rs", "bwa-mem3-rs-cli"]
 
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
-repository = "https://github.com/fg-labs/bwa-mem2-rs"
+repository = "https://github.com/fg-labs/bwa-mem3-rs"
 authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
 
 # Default clippy strictness; ci-lint promotes warnings to errors via -D warnings.
