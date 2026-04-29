@@ -1,0 +1,72 @@
+/* bwa-mem3-sys/shim/bwa_shim_types.h
+ *
+ * POD struct definitions copied from bwa-mem3's `bwamem.h` (mem_opt_t,
+ * mem_pestat_t) so bindgen can emit full Rust struct layouts without
+ * having to parse the C++ header graph rooted at bwamem.h.
+ *
+ * Keep the layouts byte-identical to bwa-mem3's. When refreshing the
+ * vendored snapshot, diff against `vendor/bwa-mem3/src/bwamem.h` around
+ * lines 76-108 (mem_opt_t) and 162-166 (mem_pestat_t); if either changed,
+ * update here.
+ */
+#ifndef BWA_SHIM_TYPES_H
+#define BWA_SHIM_TYPES_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* MEM_F_* flag bits (from bwamem.h). */
+#define MEM_F_PE             0x2
+#define MEM_F_NOPAIRING      0x4
+#define MEM_F_ALL            0x8
+#define MEM_F_NO_MULTI       0x10
+#define MEM_F_NO_RESCUE      0x20
+#define MEM_F_REF_HDR        0x100
+#define MEM_F_SOFTCLIP       0x200
+#define MEM_F_SMARTPE        0x400
+#define MEM_F_PRIMARY5       0x800
+#define MEM_F_KEEP_SUPP_MAPQ 0x1000
+
+/* Mirror of bwamem.h:76-108. Layout must match exactly. */
+typedef struct mem_opt_t {
+    int a, b;
+    int o_del, e_del;
+    int o_ins, e_ins;
+    int pen_unpaired;
+    int pen_clip5, pen_clip3;
+    int w;
+    int zdrop;
+
+    uint64_t max_mem_intv;
+
+    int T;
+    int flag;
+    int min_seed_len;
+    int min_chain_weight;
+    int max_chain_extend;
+    float split_factor;
+    int split_width;
+    int max_occ;
+    int max_chain_gap;
+    int n_threads;
+    int64_t chunk_size;
+    float mask_level;
+    float drop_ratio;
+    float XA_drop_ratio;
+    float mask_level_redun;
+    float mapQ_coef_len;
+    int mapQ_coef_fac;
+    int max_ins;
+    int max_matesw;
+    int max_XA_hits, max_XA_hits_alt;
+    int8_t mat[25];
+} mem_opt_t;
+
+/* Mirror of bwamem.h:162-166. */
+typedef struct mem_pestat_t {
+    int low, high;
+    int failed;
+    double avg, std;
+} mem_pestat_t;
+
+#endif /* BWA_SHIM_TYPES_H */

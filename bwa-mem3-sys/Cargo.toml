@@ -1,0 +1,41 @@
+[package]
+name = "bwa-mem3-sys"
+description = "Low-level FFI bindings to bwa-mem3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["external-ffi-bindings", "science"]
+keywords = ["bioinformatics", "bwa", "alignment", "ngs"]
+links = "bwa-mem3"
+readme = "README.md"
+include = [
+    "src/",
+    "build.rs",
+    "vendor/",
+    "shim/",
+    "patches/",
+    "LICENSE",
+    "README.md",
+]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+sse42 = []
+avx512 = []
+native = []
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+bindgen = "0.69"
+
+[lints]
+workspace = true

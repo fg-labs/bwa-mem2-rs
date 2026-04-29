@@ -1,0 +1,27 @@
+[package]
+name = "bwa-mem3-rs"
+description = "Safe Rust API for bwa-mem3 alignment with caller-owned parallelism"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["science", "api-bindings"]
+keywords = ["bioinformatics", "bwa", "alignment", "bam", "ngs"]
+readme = "README.md"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bwa-mem3-sys = { version = "0.1.1", path = "../bwa-mem3-sys" }
+thiserror = "1"
+libc = "0.2"
+
+[dev-dependencies]
+rayon = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

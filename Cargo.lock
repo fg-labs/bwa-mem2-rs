@@ -113,10 +113,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "bwa-mem2-rs"
+name = "bwa-mem3-rs"
 version = "0.1.1"
 dependencies = [
- "bwa-mem2-sys",
+ "bwa-mem3-sys",
  "libc",
  "rayon",
  "tempfile",
@@ -124,11 +124,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "bwa-mem2-rs-cli"
+name = "bwa-mem3-rs-cli"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "bwa-mem2-rs",
+ "bwa-mem3-rs",
  "clap",
  "flate2",
  "noodles-bgzf",
@@ -138,7 +138,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bwa-mem2-sys"
+name = "bwa-mem3-sys"
 version = "0.1.1"
 dependencies = [
  "bindgen",

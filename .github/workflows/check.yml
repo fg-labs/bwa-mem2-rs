@@ -54,26 +54,36 @@ jobs:
       - run: cargo ci-lint
 
   e2e:
-    # End-to-end regression: build the PhiX index via bwa-mem2, simulate
+    # End-to-end regression: build the PhiX index via bwa-mem3, simulate
     # paired reads, run `bwa-rs mem`, verify samtools can parse the output
     # and at least 2N records come back for N pairs.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
+      - name: Install build deps + samtools
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev samtools
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
-      - name: Install bwa-mem2 + samtools via bioconda
-        uses: mamba-org/setup-micromamba@0dea6379afdaffa5d528b3d1dabc45da37f443fc # v2.0.5
-        with:
-          environment-name: bwa-mem2-rs-e2e
-          create-args: >-
-            -c bioconda
-            -c conda-forge
-            bwa-mem2
-            samtools
-          cache-environment: true
+      # bwa-mem3 isn't on bioconda yet (upstream README: "coming soon"),
+      # so build the binary from the vendored snapshot — same source our
+      # shim wraps, so parity is exact. The vendored Makefile predates
+      # upstream's bwa-mem2 → bwa-mem3 rename and still emits a binary
+      # named `bwa-mem2`; we expose it as BWA_MEM3_BIN regardless of
+      # filename.
+      # TODO: switch back to `bioconda::bwa-mem3` once published.
+      # - name: Install bwa-mem3 + samtools via bioconda
+      #   uses: mamba-org/setup-micromamba@0dea6379afdaffa5d528b3d1dabc45da37f443fc # v2.0.5
+      #   with:
+      #     environment-name: bwa-mem3-rs-e2e
+      #     create-args: >-
+      #       -c bioconda
+      #       -c conda-forge
+      #       bwa-mem3
+      #       samtools
+      #     cache-environment: true
+      - name: Build bwa-mem3 from vendored source
+        run: |
+          make -C bwa-mem3-sys/vendor/bwa-mem3 -j"$(nproc)"
+          echo "BWA_MEM3_BIN=$PWD/bwa-mem3-sys/vendor/bwa-mem3/bwa-mem2" >> "$GITHUB_ENV"
       - name: Run e2e test
-        shell: bash -l {0}
-        run: cargo test -p bwa-mem2-rs-cli --test e2e -- --nocapture
+        run: cargo test -p bwa-mem3-rs-cli --test e2e -- --nocapture
