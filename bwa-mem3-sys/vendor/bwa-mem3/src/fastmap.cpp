@@ -32,12 +32,17 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "bwa_madvise.h"
 #if NUMA_ENABLED
 #include <numa.h>
 #endif
 #include <sstream>
+#include <getopt.h>
 #include "fastmap.h"
 #include "FMI_search.h"
+#include "bam_writer.h"
+#include "meth_bam.h"
+#include "bwa_shm.h"
 
 #if AFF && (__linux__)
 #include <sys/sysinfo.h>
@@ -190,7 +195,6 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     w.nthreads = nthreads;
 
     int32_t memSize = nreads;
-    int32_t readLen = READ_LEN;
 
     /* Mem allocation section for core kernels */
     w.regs = NULL; w.chain_ar = NULL; w.seedBuf = NULL;
@@ -252,26 +256,31 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         wsize * sizeof(SeqPair) * opt->n_threads * 3;
     fprintf(stderr, "2. Memory pre-allocation for BSW: %0.4lf MB\n", allocMem/1e6);
 
+    // SMEM buffers (matchArray / min_intv_ar / query_pos_ar / enc_qdb / rid)
+    // and the lockstep-batch slot buffers are sized from the observed max
+    // read length on each batch in mem_collect_smem; they're NULL here and
+    // grow on first use. `lim` is still a fixed BATCH_SIZE+32 allocation
+    // because its size does not depend on read length.
     for (int l=0; l<nthreads; l++)
     {
-        // BATCH_MUL accounts for smems per reads in smem kernel
-        w.mmc.wsize_mem[l]     = BATCH_MUL * BATCH_SIZE *               readLen;
-        w.mmc.wsize_mem_s[l]     = BATCH_MUL * BATCH_SIZE *               readLen;
-        w.mmc.wsize_mem_r[l]     = BATCH_MUL * BATCH_SIZE *               readLen;
-        w.mmc.matchArray[l]    = (SMEM *) _mm_malloc(w.mmc.wsize_mem[l] * sizeof(SMEM), 64);
-        w.mmc.min_intv_ar[l]   = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
-        w.mmc.query_pos_ar[l]  = (int16_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int16_t));
-        w.mmc.enc_qdb[l]       = (uint8_t *) malloc(w.mmc.wsize_mem[l] * sizeof(uint8_t));
-        w.mmc.rid[l]           = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
-        w.mmc.lim[l]           = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64); // candidate not for reallocation, deferred for next round of changes.
+        w.mmc.wsize_mem[l]     = 0;
+        w.mmc.wsize_mem_s[l]   = 0;
+        w.mmc.wsize_mem_r[l]   = 0;
+        w.mmc.matchArray[l]    = NULL;
+        w.mmc.min_intv_ar[l]   = NULL;
+        w.mmc.query_pos_ar[l]  = NULL;
+        w.mmc.enc_qdb[l]       = NULL;
+        w.mmc.rid[l]           = NULL;
+        w.mmc.lim[l]           = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
+
+        w.mmc.lockstep_prev[l]      = NULL;
+        w.mmc.lockstep_match_buf[l] = NULL;
+        w.mmc.lockstep_buf_cap[l]   = 0;
     }
 
-    allocMem = nthreads * BATCH_MUL * BATCH_SIZE * readLen * sizeof(SMEM) +
-        nthreads * BATCH_MUL * BATCH_SIZE * readLen *sizeof(int32_t) +
-        nthreads * BATCH_MUL * BATCH_SIZE * readLen *sizeof(int16_t) +
-        nthreads * BATCH_MUL * BATCH_SIZE * readLen *sizeof(int32_t) +
-        nthreads * (BATCH_SIZE + 32) * sizeof(int32_t);
-    fprintf(stderr, "3. Memory pre-allocation for BWT: %0.4lf MB\n", allocMem/1e6);
+    allocMem = nthreads * (BATCH_SIZE + 32) * sizeof(int32_t);
+    fprintf(stderr, "3. Memory pre-allocation for BWT (lazy SMEM buffers, %ld B fixed): %0.4lf MB\n",
+            (long)(nthreads * (BATCH_SIZE + 32) * sizeof(int32_t)), allocMem/1e6);
     fprintf(stderr, "------------------------------------------\n");
 }
 
@@ -302,6 +311,9 @@ void worker_free(worker_t &w, int32_t nthreads)
         free(w.mmc.seqPairArrayRight128[l]);
     }
 
+    // NULL-safe: SMEM buffers are now allocated lazily on first batch;
+    // workers that never ran a batch leave them as NULL. _mm_free / free
+    // are both well-defined on NULL.
     for(int l=0; l<nthreads; l++) {
         _mm_free(w.mmc.matchArray[l]);
         free(w.mmc.min_intv_ar[l]);
@@ -309,10 +321,13 @@ void worker_free(worker_t &w, int32_t nthreads)
         free(w.mmc.enc_qdb[l]);
         free(w.mmc.rid[l]);
         _mm_free(w.mmc.lim[l]);
+
+        _mm_free(w.mmc.lockstep_prev[l]);
+        _mm_free(w.mmc.lockstep_match_buf[l]);
     }
 }
 
-// Back-compat wrapper used by the bwa-mem2 pipeline.
+// Back-compat wrapper used by the bwa-mem3 pipeline.
 void memoryAlloc(ktp_aux_t *aux, worker_t &w, int32_t nreads, int32_t nthreads)
 {
     worker_alloc(aux->opt, w, nreads, nthreads);
@@ -349,6 +364,70 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             for (int i = 0; i < ret->n_seqs; ++i){
                 free(ret->seqs[i].comment);
                 ret->seqs[i].comment = 0;
+            }
+        }
+
+        /* Inline bwameth-style c2t conversion on read ingest. Matches
+         * `bwameth.py c2t R1.fq R2.fq`: R1 reads get C→T, R2 reads get G→A.
+         * The original sequence is stashed as a YS:Z comment tag and the
+         * conversion type as YC:Z — these pass through to SAM via
+         * copy_comment (which --meth sets).
+         *
+         * R1/R2 classification:
+         *   - Non-smart-pair PE (two FASTQs): records are strictly
+         *     interleaved R1/R2/R1/R2… in ret->seqs, so record parity
+         *     (i & 1) identifies R2.
+         *   - Smart-pair (-p, single stream): the stream can contain
+         *     orphans, so parity mis-tags them. Classify by adjacent-name
+         *     pairing (same rule as bseq_classify) — if this read's name
+         *     matches the previous unmatched read's name, it is R2;
+         *     otherwise it starts a new pair as R1.
+         *   - SE: always R1. */
+        if (aux->opt->meth_mode) {
+            int is_pe    = (aux->opt->flag & MEM_F_PE) != 0;
+            int is_smart = (aux->opt->flag & MEM_F_SMARTPE) != 0;
+            int prev_is_r1 = 0;
+            for (int i = 0; i < ret->n_seqs; ++i) {
+                bseq1_t *s = &ret->seqs[i];
+                int is_r2;
+                if (!is_pe) {
+                    is_r2 = 0;
+                } else if (!is_smart) {
+                    is_r2 = (i & 1);
+                } else if (prev_is_r1 && i > 0
+                           && strcmp(s->name, ret->seqs[i-1].name) == 0) {
+                    is_r2 = 1;
+                    prev_is_r1 = 0;
+                } else {
+                    is_r2 = 0;
+                    prev_is_r1 = 1;
+                }
+                const char *yc = is_r2 ? "GA" : "CT";
+                char from = is_r2 ? 'G' : 'C';
+                char from_lo = is_r2 ? 'g' : 'c';
+                char to   = is_r2 ? 'A' : 'T';
+                int l = s->l_seq;
+                /* Build the YS:Z/YC:Z comment. Preserve any prior FASTQ
+                 * comment (e.g. -C carries barcode/UMI SAM tags) by appending
+                 * it after YC; otherwise --meth silently strips -C metadata. */
+                const char *prior = s->comment;
+                size_t prior_len = prior ? strlen(prior) : 0;
+                size_t yslen = (size_t)l + 32 + (prior_len ? prior_len + 1 : 0);
+                char *comment = (char *)malloc(yslen);
+                assert(comment != NULL);
+                int off = snprintf(comment, yslen, "YS:Z:");
+                memcpy(comment + off, s->seq, (size_t)l);
+                off += l;
+                off += snprintf(comment + off, yslen - off, "\tYC:Z:%s", yc);
+                if (prior_len)
+                    snprintf(comment + off, yslen - off, "\t%s", prior);
+                free(s->comment);
+                s->comment = comment;
+                /* Project in place. */
+                for (int j = 0; j < l; ++j) {
+                    char c = s->seq[j];
+                    if (c == from || c == from_lo) s->seq[j] = to;
+                }
             }
         }
         {
@@ -399,8 +478,14 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                                  0,
                                  w);
 
-                for (int i = 0; i < n_sep[0]; ++i)
-                    ret->seqs[sep[0][i].id].sam = sep[0][i].sam;
+                for (int i = 0; i < n_sep[0]; ++i) {
+                    bseq1_t *dst = &ret->seqs[sep[0][i].id];
+                    bseq1_t *src = &sep[0][i];
+                    dst->sam      = src->sam;      src->sam      = NULL;
+                    dst->bams     = src->bams;     src->bams     = NULL;
+                    dst->n_bams   = src->n_bams;   src->n_bams   = 0;
+                    dst->cap_bams = src->cap_bams; src->cap_bams = 0;
+                }
             }
             if (n_sep[1]) {
                 tmp_opt.flag |= MEM_F_PE;
@@ -412,8 +497,14 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                                  aux->pes0,
                                  w);
 
-                for (int i = 0; i < n_sep[1]; ++i)
-                    ret->seqs[sep[1][i].id].sam = sep[1][i].sam;
+                for (int i = 0; i < n_sep[1]; ++i) {
+                    bseq1_t *dst = &ret->seqs[sep[1][i].id];
+                    bseq1_t *src = &sep[1][i];
+                    dst->sam      = src->sam;      src->sam      = NULL;
+                    dst->bams     = src->bams;     src->bams     = NULL;
+                    dst->n_bams   = src->n_bams;   src->n_bams   = 0;
+                    dst->cap_bams = src->cap_bams; src->cap_bams = 0;
+                }
             }
             free(sep[0]); free(sep[1]);
         }
@@ -436,15 +527,77 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
     {
         uint64_t tim = __rdtsc();
 
-        for (int i = 0; i < ret->n_seqs; ++i)
+        for (int i = 0; i < ret->n_seqs; )
         {
-            if (ret->seqs[i].sam) {
-                // err_fputs(ret->seqs[i].sam, stderr);
-                fputs(ret->seqs[i].sam, aux->fp);
+            int group_size = 1;
+            if (aux->opt->meth_mode && (aux->opt->flag & MEM_F_PE)
+                && i + 1 < ret->n_seqs
+                && strcmp(ret->seqs[i].name, ret->seqs[i+1].name) == 0) {
+                group_size = 2;
             }
-            free(ret->seqs[i].name); free(ret->seqs[i].comment);
-            free(ret->seqs[i].seq); free(ret->seqs[i].qual);
-            free(ret->seqs[i].sam);
+
+            if (aux->opt->meth_mode && g_meth_bam_writer != NULL) {
+                /* Gather all bam1_t* in the QNAME group, propagate QC fail, emit. */
+                int total = 0;
+                for (int k = 0; k < group_size; ++k) total += ret->seqs[i+k].n_bams;
+                if (total > 0) {
+                    struct bam1_t **group = (struct bam1_t **)malloc(total * sizeof(struct bam1_t *));
+                    if (group == NULL)
+                        err_fatal(__func__, "out of memory gathering meth BAM group of %d", total);
+                    int idx = 0;
+                    for (int k = 0; k < group_size; ++k) {
+                        for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
+                            group[idx++] = (struct bam1_t *)ret->seqs[i+k].bams[j];
+                        }
+                    }
+                    meth_bam_group_propagate_qcfail(group, total);
+                    for (int j = 0; j < total; ++j) {
+#ifndef DISABLE_OUTPUT
+                        if (meth_bam_writer_write(g_meth_bam_writer, group[j]) < 0)
+                            err_fatal(__func__, "failed to write meth BAM record");
+#endif
+                        bam_writer_free(group[j]);
+                    }
+                    free(group);
+                }
+            } else if (aux->bam_writer != NULL) {
+                for (int k = 0; k < group_size; ++k) {
+                    for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
+#ifndef DISABLE_OUTPUT
+                        if (bam_writer_write(aux->bam_writer, (struct bam1_t *)ret->seqs[i+k].bams[j]) < 0)
+                            err_fatal(__func__, "failed to write BAM record");
+#endif
+                        bam_writer_free((struct bam1_t *)ret->seqs[i+k].bams[j]);
+                    }
+                }
+            } else {
+                for (int k = 0; k < group_size; ++k) {
+                    if (ret->seqs[i+k].sam) {
+#ifndef DISABLE_OUTPUT
+                        fputs(ret->seqs[i+k].sam, aux->fp);
+#endif
+                    }
+                    /* meth_mode populates bams[] regardless of writer state;
+                     * under DISABLE_OUTPUT both writers are forced NULL and
+                     * we land here, so the per-record bam1_t allocations
+                     * would otherwise leak (only the pointer array below is
+                     * freed). Profile-build only, but it skews the very
+                     * Maximum RSS that bench/run.sh records. */
+                    for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
+                        bam_writer_free((struct bam1_t *)ret->seqs[i+k].bams[j]);
+                    }
+                }
+            }
+
+            for (int k = 0; k < group_size; ++k) {
+                free(ret->seqs[i+k].name);
+                free(ret->seqs[i+k].comment);
+                free(ret->seqs[i+k].seq);
+                free(ret->seqs[i+k].qual);
+                free(ret->seqs[i+k].sam);
+                free(ret->seqs[i+k].bams);
+            }
+            i += group_size;
         }
         free(ret->seqs);
         free(ret);
@@ -593,7 +746,7 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     }
 #endif
 
-    int32_t nreads = aux->actual_chunk_size/ READ_LEN + 10;
+    int32_t nreads = aux->actual_chunk_size / NREADS_ESTIMATE_AVG_BASES + 10;
 
     /* All memory allocation */
     memoryAlloc(aux, w, nreads, nthreads);
@@ -675,10 +828,12 @@ static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
 
 static void usage(const mem_opt_t *opt)
 {
-    fprintf(stderr, "Usage: bwa-mem2 mem [options] <idxbase> <in1.fq> [in2.fq]\n");
+    fprintf(stderr, "Usage: bwa-mem3 mem [options] <idxbase> <in1.fq> [in2.fq]\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  Algorithm options:\n");
     fprintf(stderr, "    -o STR        Output SAM file name\n");
+    fprintf(stderr, "    --bam[=N]     Emit BAM instead of SAM text. N=0 (default) = uncompressed;\n");
+    fprintf(stderr, "                  1..9 = BGZF deflate levels. Writes to stdout; redirect with `>`.\n");
     fprintf(stderr, "    -t INT        number of threads [%d]\n", opt->n_threads);
     fprintf(stderr, "    -k INT        minimum seed length [%d]\n", opt->min_seed_len);
     fprintf(stderr, "    -w INT        band width for banded alignment [%d]\n", opt->w);
@@ -690,7 +845,6 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
     fprintf(stderr, "    -S            skip mate rescue\n");
-    fprintf(stderr, "    -o            output file name missing\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
     fprintf(stderr, "Scoring options:\n");
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
@@ -713,7 +867,10 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -K INT        process INT input bases in each batch regardless of nThreads (for reproducibility) []\n");
     fprintf(stderr, "   -v INT        verbose level: 1=error, 2=warning, 3=message, 4+=debugging [%d]\n", bwa_verbose);
     fprintf(stderr, "   -T INT        minimum score to output [%d]\n", opt->T);
-    fprintf(stderr, "   -h INT[,INT]  if there are <INT hits with score >80%% of the max score, output all in XA [%d,%d]\n", opt->max_XA_hits, opt->max_XA_hits_alt);
+    fprintf(stderr, "   -h INT[,INT]  if there are <INT hits with score >%.2f%% of the max score, output all in XA [%d,%d]\n",
+            opt->XA_drop_ratio * 100.0, opt->max_XA_hits, opt->max_XA_hits_alt);
+    fprintf(stderr, "   -z FLOAT      the fraction of the max score to use with -h [%.2f]\n", opt->XA_drop_ratio);
+    fprintf(stderr, "   -u            output XB instead of XA; XB is XA with the alignment score and mapping quality added\n");
     fprintf(stderr, "   -a            output all alignments for SE or unpaired PE\n");
     fprintf(stderr, "   -C            append FASTA/FASTQ comment to SAM output\n");
     fprintf(stderr, "   -V            output the reference FASTA header in the XR tag\n");
@@ -723,7 +880,85 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 specify the mean, standard deviation (10%% of the mean if absent), max\n");
     fprintf(stderr, "                 (4 sigma from the mean if absent) and min of the insert size distribution.\n");
     fprintf(stderr, "                 FR orientation only. [inferred]\n");
+    fprintf(stderr, "Bisulfite (--meth) options:\n");
+    fprintf(stderr, "   --meth        enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM\n");
+    fprintf(stderr, "                 emission. Implies --bam. Requires the reference to have been built\n");
+    fprintf(stderr, "                 with `bwa-mem3 index --meth` (emits ref.fa.bwameth.c2t).\n");
+    fprintf(stderr, "   --set-as-failed f|r\n");
+    fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
+    fprintf(stderr, "   --do-not-penalize-chimeras\n");
+    fprintf(stderr, "                 disable the longest-match <44%% chimera heuristic (no 0x200 / MAPQ cap)\n");
+    fprintf(stderr, "Supplementary MAPQ rescoring (fg-labs extension):\n");
+    fprintf(stderr, "   --supp-rep-hard-cap INT\n");
+    fprintf(stderr, "                 force MAPQ=0 for supplementary alignments whose chain contains any seed\n");
+    fprintf(stderr, "                 with >=INT genome occurrences (i.e. the supp region is repetitive on its\n");
+    fprintf(stderr, "                 own). 0 disables (default). Typical values 5-20; lower = more aggressive.\n");
+    fprintf(stderr, "                 Primary MAPQ is unaffected.\n");
+    fprintf(stderr, "Help:\n");
+    fprintf(stderr, "   --help        print this help message and exit\n");
     fprintf(stderr, "Note: Please read the man page for detailed description of the command line and options.\n");
+}
+
+/* Resolve `<prefix>.0123` to a `uint8_t *` view of the ref string. If
+ * `shm_base` is non-NULL, the FMI loader already attached this segment;
+ * resolve REF_STRING via that single mapping. Otherwise fall back to the
+ * disk slurp. The two paths must agree: if FMI came from disk, ref string
+ * must come from disk too, so we never call `bwa_shm_attach` here. */
+static uint8_t *load_ref_string(const char *prefix, uint8_t *shm_base,
+                                int64_t *rlen_out, int *is_shm_out)
+{
+    *is_shm_out = 0;
+    *rlen_out   = 0;
+
+    if (shm_base != NULL) {
+        uint64_t off = 0, sz = 0;
+        if (bwa_shm_section_find(shm_base, BWA_SHM_SEC_REF_STRING, &off, &sz) != 0) {
+            fprintf(stderr,
+                "ERROR: shm segment for '%s' is missing REF_STRING; aborting.\n"
+                "       The segment was staged by an older bwa-mem3; drop and re-stage.\n",
+                prefix);
+            exit(EXIT_FAILURE);
+        }
+        *is_shm_out = 1;
+        *rlen_out   = (int64_t)sz;
+        fprintf(stderr, "* Reference genome attached from shm: %lld bytes\n",
+                (long long)sz);
+        return shm_base + off;
+    }
+
+    /* Disk path. */
+    char binary_seq_file[PATH_MAX];
+    strcpy_s(binary_seq_file, PATH_MAX, prefix);
+    strcat_s(binary_seq_file, PATH_MAX, ".0123");
+
+    fprintf(stderr, "* Binary seq file = %s\n", binary_seq_file);
+    FILE *fr = fopen(binary_seq_file, "r");
+    if (fr == NULL) {
+        fprintf(stderr, "Error: can't open %s input file\n", binary_seq_file);
+        return NULL;
+    }
+    int64_t rlen = 0;
+    if (fseek(fr, 0, SEEK_END) != 0) {
+        fprintf(stderr, "Error: fseek failed on %s\n", binary_seq_file);
+        fclose(fr);
+        return NULL;
+    }
+    rlen = ftell(fr);
+    if (rlen <= 0) {
+        fprintf(stderr, "Error: %s is empty or unseekable (ftell=%lld)\n",
+                binary_seq_file, (long long)rlen);
+        fclose(fr);
+        return NULL;
+    }
+    uint8_t *buf = (uint8_t*) _mm_malloc(rlen, 64);
+    assert_not_null(buf, rlen, rlen);
+    bwamem_madv_hugepage(buf, rlen);
+    rewind(fr);
+    err_fread_noeof(buf, 1, rlen, fr);
+    fclose(fr);
+
+    *rlen_out = rlen;
+    return buf;
 }
 
 int main_mem(int argc, char *argv[])
@@ -739,7 +974,9 @@ int main_mem(int argc, char *argv[])
     int           fd, fd2;
     mem_pestat_t  pes[4];
     ktp_aux_t     aux;
-    bool          is_o    = 0;
+    bool          is_o       = 0;
+    const char   *out_path   = NULL;   /* -o/-f path; opened lazily so --bam can claim it */
+    bool          out_opened = false;  /* true iff aux.fp is a real fopen()'d FILE* we own */
     uint8_t      *ref_string;
 
     memset(&aux, 0, sizeof(ktp_aux_t));
@@ -753,7 +990,31 @@ int main_mem(int argc, char *argv[])
 
     /* Parse input arguments */
     // comment: added option '5' in the list
-    while ((c = getopt(argc, argv, "51qpaMCSPVYjk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:")) >= 0)
+    //
+    // Long-only options for bisulfite mode (bwa-mem3 meth fork):
+    //   --meth                      Enable inline bwameth-style c2t + post-processing + BAM output.
+    //                               Expects a reference built with `bwa-mem3 index --meth`.
+    //   --set-as-failed f|r         Flag alignments to this strand as QC-fail (0x200)
+    //   --do-not-penalize-chimeras  Skip the longest-match <44% chimera heuristic
+    enum {
+        OPT_BAM = 1000,
+        OPT_METH,
+        OPT_METH_SET_AS_FAILED,
+        OPT_METH_NO_CHIMERA,
+        OPT_SUPP_REP_HARD_CAP,
+        OPT_HELP,
+    };
+    static struct option long_opts[] = {
+        {"bam",                      optional_argument, 0, OPT_BAM},
+        {"meth",                     no_argument,       0, OPT_METH},
+        {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
+        {"do-not-penalize-chimeras", no_argument,       0, OPT_METH_NO_CHIMERA},
+        {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
+        {"help",                     no_argument,       0, OPT_HELP},
+        {0, 0, 0, 0}
+    };
+    while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
+                            long_opts, NULL)) >= 0)
     {
         if (c == 'k') opt->min_seed_len = atoi(optarg), opt0.min_seed_len = 1;
         else if (c == '1') no_mt_io = 1;
@@ -768,13 +1029,11 @@ int main_mem(int argc, char *argv[])
             opt->n_threads = atoi(optarg), opt->n_threads = opt->n_threads > 1? opt->n_threads : 1, assert(opt->n_threads >= INT_MIN && opt->n_threads <= INT_MAX);
         else if (c == 'o' || c == 'f')
         {
+            /* Capture the path; defer opening until after --bam is parsed so
+             * BAM mode can hand the path to htslib instead of truncating it
+             * here as a SAM-text FILE*. */
             is_o = 1;
-            aux.fp = fopen(optarg, "w");
-            if (aux.fp == NULL) {
-                fprintf(stderr, "Error: can't open %s input file\n", optarg);
-                exit(EXIT_FAILURE);
-            }
-            /*fclose(aux.fp);*/
+            out_path = optarg;
         }
         else if (c == 'P') opt->flag |= MEM_F_NOPAIRING;
         else if (c == 'a') opt->flag |= MEM_F_ALL;
@@ -785,6 +1044,7 @@ int main_mem(int argc, char *argv[])
         else if (c == 'V') opt->flag |= MEM_F_REF_HDR;
         else if (c == '5') opt->flag |= MEM_F_PRIMARY5 | MEM_F_KEEP_SUPP_MAPQ; // always apply MEM_F_KEEP_SUPP_MAPQ with -5
         else if (c == 'q') opt->flag |= MEM_F_KEEP_SUPP_MAPQ;
+        else if (c == 'u') opt->flag |= MEM_F_XB;
         else if (c == 'c') opt->max_occ = atoi(optarg), opt0.max_occ = 1;
         else if (c == 'd') opt->zdrop = atoi(optarg), opt0.zdrop = 1;
         else if (c == 'v') bwa_verbose = atoi(optarg);
@@ -812,6 +1072,7 @@ int main_mem(int argc, char *argv[])
             if (*p != 0 && ispunct(*p) && isdigit(p[1]))
                 opt->max_XA_hits_alt = strtol(p+1, &p, 10);
         }
+        else if (c == 'z') opt->XA_drop_ratio = atof(optarg);
         else if (c == 'Q')
         {
             opt0.mapQ_coef_len = 1;
@@ -843,7 +1104,7 @@ int main_mem(int argc, char *argv[])
         {
             if ((rg_line = bwa_set_rg(optarg)) == 0) {
                 free(opt);
-                if (is_o)
+                if (out_opened)
                     fclose(aux.fp);
                 return 1;
             }
@@ -855,20 +1116,61 @@ int main_mem(int argc, char *argv[])
                 FILE *fp;
                 if ((fp = fopen(optarg, "r")) != 0)
                 {
-                    char *buf;
-                    buf = (char *) calloc(1, 0x10000);
-                    assert(buf != NULL);
-                    while (fgets(buf, 0xffff, fp))
-                    {
-                        i = strlen(buf);
-                        assert(buf[i-1] == '\n');
-                        buf[i-1] = 0;
-                        hdr_line = bwa_insert_header(buf, hdr_line);
-                    }
-                    free(buf);
+                    hdr_line = bwa_insert_header_file(fp, hdr_line);
                     fclose(fp);
                 }
             } else hdr_line = bwa_insert_header(optarg, hdr_line);
+        }
+        else if (c == OPT_BAM) {
+            opt->bam_mode = 1;
+            opt->bam_level = 0;
+            if (optarg != NULL && optarg[0] != '\0') {
+                int lvl = atoi(optarg);
+                if (lvl < 0 || lvl > 9) {
+                    fprintf(stderr, "ERROR: --bam level must be 0..9 (got '%s')\n", optarg);
+                    free(opt);
+                    if (out_opened) fclose(aux.fp);
+                    return 1;
+                }
+                opt->bam_level = lvl;
+            }
+        }
+        else if (c == OPT_METH) {
+            opt->meth_mode = 1;
+            opt->bam_mode = 1;  /* meth implies BAM output */
+        }
+        else if (c == OPT_METH_SET_AS_FAILED) {
+            if (optarg == NULL || !(optarg[0] == 'f' || optarg[0] == 'r') || optarg[1] != '\0') {
+                fprintf(stderr, "ERROR: --set-as-failed requires 'f' or 'r'\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->meth_set_as_failed = optarg[0];
+        }
+        else if (c == OPT_METH_NO_CHIMERA) {
+            opt->meth_no_chim = 1;
+        }
+        else if (c == OPT_SUPP_REP_HARD_CAP) {
+            char *end = NULL;
+            errno = 0;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || end == NULL || *end != '\0' ||
+                errno == ERANGE || v < 0 || v > INT_MAX) {
+                fprintf(stderr, "ERROR: --supp-rep-hard-cap requires a non-negative integer\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->supp_rep_hard_cap = (int)v;
+        }
+        else if (c == OPT_HELP) {
+            usage(opt);
+            free(opt);
+            free(hdr_line);
+            free(rg_line);
+            if (out_opened) fclose(aux.fp);
+            return 0;
         }
         else if (c == 'I')
         {
@@ -888,7 +1190,7 @@ int main_mem(int argc, char *argv[])
         }
         else {
             free(opt);
-            if (is_o)
+            if (out_opened)
                 fclose(aux.fp);
             return 1;
         }
@@ -905,7 +1207,7 @@ int main_mem(int argc, char *argv[])
     if (optind + 2 != argc && optind + 3 != argc) {
         usage(opt);
         free(opt);
-        if (is_o)
+        if (out_opened)
             fclose(aux.fp);
         return 1;
     }
@@ -913,7 +1215,7 @@ int main_mem(int argc, char *argv[])
     /* Further input parsing */
     if (mode)
     {
-        fprintf(stderr, "WARNING: bwa-mem2 doesn't work well with long reads or contigs; please use minimap2 instead.\n");
+        fprintf(stderr, "WARNING: bwa-mem3 doesn't work well with long reads or contigs; please use minimap2 instead.\n");
         if (strcmp(mode, "intractg") == 0)
         {
             if (!opt0.o_del) opt->o_del = 16;
@@ -949,55 +1251,77 @@ int main_mem(int argc, char *argv[])
         {
             fprintf(stderr, "[E::%s] unknown read type '%s'\n", __func__, mode);
             free(opt);
-            if (is_o)
+            if (out_opened)
                 fclose(aux.fp);
             return 1;
         }
     } else update_a(opt, &opt0);
 
+    /* Meth-mode default tuning. bwameth.py runs bwa-mem3 with
+     * -B 2 -L 10 -U 100 -T 40 -CM — these reduce mismatch and soft-clip
+     * penalties so BS reads get long un-clipped alignments, raise the
+     * output score threshold, mark shorter hits as secondary, and
+     * pass the YS/YC comment tags through to SAM. We apply the same
+     * defaults when --meth is set, modulo explicit CLI overrides. */
+    if (opt->meth_mode) {
+        if (!opt0.b)            opt->b           = 2;
+        if (!opt0.pen_clip5)    opt->pen_clip5   = 10;
+        if (!opt0.pen_clip3)    opt->pen_clip3   = 10;
+        if (!opt0.pen_unpaired) opt->pen_unpaired= 100;
+        if (!opt0.T)            opt->T           = 40;
+        opt->flag |= MEM_F_NO_MULTI;   /* -M */
+        aux.copy_comment = 1;          /* -C, needed for YS:Z/YC:Z passthrough */
+    }
+
     /* Matrix for SWA */
     bwa_fill_scmat(opt->a, opt->b, opt->mat);
+
+    /* In --meth the canonical UX is "bwa-mem3 mem --meth ref.fa" and
+     * we auto-append ".bwameth.c2t" to find the index built by
+     * "bwa-mem3 index --meth". If the user (or bwameth.py's internal
+     * invocation) already passed the ".bwameth.c2t" path directly, use
+     * it as-is rather than double-appending. */
+    char c2t_ref[PATH_MAX];
+    const char *ref_prefix = argv[optind];
+    if (opt->meth_mode) {
+        const char *suffix = ".bwameth.c2t";
+        size_t slen = strlen(suffix);
+        size_t alen = strlen(argv[optind]);
+        int already_c2t = (alen >= slen) &&
+                          (strcmp(argv[optind] + alen - slen, suffix) == 0);
+        if (!already_c2t) {
+            int n = snprintf(c2t_ref, sizeof(c2t_ref), "%s%s", argv[optind], suffix);
+            if (n <= 0 || (size_t)n >= sizeof(c2t_ref)) {
+                fprintf(stderr, "ERROR: ref path too long for --meth\n");
+                exit(EXIT_FAILURE);
+            }
+            ref_prefix = c2t_ref;
+        }
+    }
 
     /* Load bwt2/FMI index */
     uint64_t tim = __rdtsc();
 
-    fprintf(stderr, "* Ref file: %s\n", argv[optind]);
-    aux.fmi = new FMI_search(argv[optind]);
+    fprintf(stderr, "* Ref file: %s\n", ref_prefix);
+    aux.fmi = new FMI_search(ref_prefix);
     aux.fmi->load_index();
+    aux.shm_base = aux.fmi->shm_attached_base();
     tprof[FMI][0] += __rdtsc() - tim;
 
-    // reading ref string from the file
+    // reading ref string (from shm if FMI attached, else from .0123 file)
     tim = __rdtsc();
     fprintf(stderr, "* Reading reference genome..\n");
-
-    char binary_seq_file[PATH_MAX];
-    strcpy_s(binary_seq_file, PATH_MAX, argv[optind]);
-    strcat_s(binary_seq_file, PATH_MAX, ".0123");
-    //sprintf(binary_seq_file, "%s.0123", argv[optind]);
-
-    fprintf(stderr, "* Binary seq file = %s\n", binary_seq_file);
-    FILE *fr = fopen(binary_seq_file, "r");
-
-    if (fr == NULL) {
-        fprintf(stderr, "Error: can't open %s input file\n", binary_seq_file);
+    int64_t rlen = 0;
+    int     ref_is_shm = 0;
+    ref_string = load_ref_string(ref_prefix, aux.shm_base, &rlen, &ref_is_shm);
+    if (ref_string == NULL) {
         exit(EXIT_FAILURE);
     }
-
-    int64_t rlen = 0;
-    fseek(fr, 0, SEEK_END);
-    rlen = ftell(fr);
-    ref_string = (uint8_t*) _mm_malloc(rlen, 64);
-    aux.ref_string = ref_string;
-    rewind(fr);
-
-    /* Reading ref. sequence */
-    err_fread_noeof(ref_string, 1, rlen, fr);
-
-    uint64_t timer  = __rdtsc();
+    aux.ref_string         = ref_string;
+    aux.ref_string_is_shm  = ref_is_shm;
+    uint64_t timer = __rdtsc();
     tprof[REF_IO][0] += timer - tim;
-
-    fclose(fr);
-    fprintf(stderr, "* Reference genome size: %ld bp\n", rlen);
+    fprintf(stderr, "* Reference genome size: %ld bp\n", (long)rlen);
     fprintf(stderr, "* Done reading reference genome !!\n\n");
 
     if (ignore_alt)
@@ -1009,7 +1333,7 @@ int main_mem(int argc, char *argv[])
 	if (ko == 0) {
 		fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 1]);
         free(opt);
-        if (is_o)
+        if (out_opened)
             fclose(aux.fp);
         delete aux.fmi;
         // kclose(ko);
@@ -1036,7 +1360,7 @@ int main_mem(int argc, char *argv[])
                 free(ko);
                 err_gzclose(fp);
                 kseq_destroy(aux.ks);
-                if (is_o)
+                if (out_opened)
                     fclose(aux.fp);
                 delete aux.fmi;
                 kclose(ko);
@@ -1051,7 +1375,99 @@ int main_mem(int argc, char *argv[])
         }
     }
 
-    bwa_print_sam_hdr(aux.fmi->idx->bns, hdr_line, aux.fp);
+    /* Look up optional per-index header records (<prefix>.hdr or
+     * <baseprefix>.dict) once and route them into both output paths. The
+     * SAM text path merges these with user -H per lh3/bwa#348 precedence;
+     * the --bam path forwards them to htslib's sam_hdr_add_lines so the
+     * rich @SQ (AS/M5/SP/AH/…) also makes it into the BAM header. */
+    char *idx_hdr_lines = bwa_load_hdr_from_index(ref_prefix);
+
+    /* Output path:
+     *  - --meth: open meth_bam_writer with strand-consolidated SQ headers.
+     *    Honors -o/-f (target path) or stdout ("-").
+     *  - --bam (no --meth): open generic bam_writer; htslib writes its own
+     *    @HD + @SQ + @PG header. Honors -o/-f or stdout.
+     *  - SAM text: open -o/-f path (if any) as a FILE*; bwa_print_sam_hdr2. */
+    bam_writer_t *bam_writer = NULL;
+#ifdef DISABLE_OUTPUT
+    /* profile-build (-DDISABLE_OUTPUT) skips ALL filesystem-touching output
+     * code so wall-clock measurements aren't gated on disk speed. The
+     * per-record write sites below are also #ifndef-guarded; this block
+     * additionally skips writer open + header emit so a non-writable -o
+     * (or read-only fs) doesn't fail before compute begins. */
+    aux.bam_writer = NULL;
+    g_meth_bam_writer = NULL;
+    if (opt->meth_mode) {
+        g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
+        /* g_meth_cmap is consulted by per-record paths even with output
+         * disabled; build it so meth_mode tagging stays consistent. */
+        if (g_meth_cmap == NULL) {
+            fprintf(stderr, "ERROR: meth: failed to build chrom map\n");
+            free(opt);
+            delete aux.fmi;
+            return 1;
+        }
+    }
+    (void)is_o;
+    (void)hdr_line;
+    (void)idx_hdr_lines;
+    (void)out_path;
+#else
+    if (opt->meth_mode) {
+        g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
+        if (g_meth_cmap == NULL) {
+            fprintf(stderr, "ERROR: meth: failed to build chrom map\n");
+            free(opt);
+            delete aux.fmi;
+            return 1;
+        }
+        const char *meth_out_path = is_o ? out_path : "-";
+        extern char *bwa_pg;
+        g_meth_bam_writer = meth_bam_writer_open(meth_out_path, g_meth_cmap, bwa_pg, NULL,
+                                                 opt->bam_level);
+        if (g_meth_bam_writer == NULL) {
+            fprintf(stderr, "ERROR: meth: failed to open BAM writer for '%s'\n", meth_out_path);
+            meth_chrom_map_free(g_meth_cmap); g_meth_cmap = NULL;
+            free(opt);
+            delete aux.fmi;
+            return 1;
+        }
+    } else if (opt->bam_mode) {
+        const char *bam_path = is_o ? out_path : "-";
+        extern char *bwa_pg;
+        /* Suppress idx .hdr/.dict records entirely when the user's -H
+         * supplies any @SQ, matching bwa_print_sam_hdr2's SAM precedence. */
+        const char *bam_idx_hdr = idx_hdr_lines;
+        if (hdr_line != NULL) {
+            if (strncmp(hdr_line, "@SQ\t", 4) == 0 ||
+                strstr(hdr_line, "\n@SQ\t") != NULL)
+                bam_idx_hdr = NULL;
+        }
+        bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns,
+                                     bam_idx_hdr, hdr_line,
+                                     bwa_pg, opt->bam_level);
+        if (bam_writer == NULL) {
+            fprintf(stderr, "ERROR: failed to open BAM writer at '%s'\n", bam_path);
+            free(opt);
+            delete aux.fmi;
+            return 1;
+        }
+        aux.bam_writer = bam_writer;
+    } else {
+        aux.bam_writer = NULL;
+        if (is_o) {
+            aux.fp = fopen(out_path, "w");
+            if (aux.fp == NULL) {
+                fprintf(stderr, "Error: can't open %s output file\n", out_path);
+                free(opt);
+                delete aux.fmi;
+                return 1;
+            }
+            out_opened = true;
+        }
+        bwa_print_sam_hdr2(aux.fmi->idx->bns, idx_hdr_lines, hdr_line, aux.fp);
+    }
+#endif
 
     if (fixed_chunk_size > 0)
         aux.task_size = fixed_chunk_size;
@@ -1068,10 +1484,18 @@ int main_mem(int argc, char *argv[])
 
     tprof[PROCESS][0] += __rdtsc() - tim;
 
+    /* Close meth BAM writer BEFORE free(opt) — opt->meth_mode is checked here. */
+    int meth_mode_local = opt->meth_mode;
+
     // free memory
     int32_t nt = aux.opt->n_threads;
-    _mm_free(ref_string);
+    if (!aux.ref_string_is_shm) {
+        _mm_free(ref_string);
+    }
+    /* When ref_string aliases shm, the segment is owned by the loader
+     * process; the kernel reclaims the mapping at process exit. */
     free(hdr_line);
+    free(idx_hdr_lines);
     free(opt);
     kseq_destroy(aux.ks);
     err_gzclose(fp); kclose(ko);
@@ -1082,8 +1506,36 @@ int main_mem(int argc, char *argv[])
         err_gzclose(fp2); kclose(ko2);
     }
 
-    if (is_o) {
+    /* BGZF flush + EOF marker errors surface only on close. Propagate to the
+     * exit code so a truncated BAM doesn't masquerade as a successful run. */
+    int exit_code = 0;
+    if (meth_mode_local && g_meth_bam_writer != NULL) {
+        int rc = meth_bam_writer_close(g_meth_bam_writer);
+        if (rc != 0) {
+            fprintf(stderr, "[meth] ERROR: BAM writer close rc=%d\n", rc);
+            exit_code = 1;
+        }
+        g_meth_bam_writer = NULL;
+    }
+    /* Free g_meth_cmap independently of g_meth_bam_writer: under
+     * -DDISABLE_OUTPUT the writer is never opened, but the chrom map is
+     * still built so per-record paths see consistent tagging. The
+     * branch above only fires when the writer exists, so freeing the
+     * map there would leak on the DISABLE_OUTPUT path. */
+    if (meth_mode_local && g_meth_cmap != NULL) {
+        meth_chrom_map_free(g_meth_cmap);
+        g_meth_cmap = NULL;
+    }
+    if (out_opened) {
         fclose(aux.fp);
+    }
+
+    if (bam_writer != NULL) {
+        if (bam_writer_close(bam_writer) != 0) {
+            fprintf(stderr, "[bam_writer] ERROR: close returned non-zero\n");
+            exit_code = 1;
+        }
+        aux.bam_writer = NULL;
     }
 
     // new bwt/FMI
@@ -1093,5 +1545,5 @@ int main_mem(int argc, char *argv[])
     tprof[MEM][0] = __rdtsc() - tprof[MEM][0];
     display_stats(nt);
 
-    return 0;
+    return exit_code;
 }

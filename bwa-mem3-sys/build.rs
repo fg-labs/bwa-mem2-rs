@@ -114,9 +114,14 @@ fn main() {
     build.cpp(true);
 
     let skip: &[&str] = &[
-        "main.cpp",     // CLI entry point
-        "bwtindex.cpp", // index builder; out of scope (users run bwa-mem3 index)
-        "runsimd.cpp",  // runtime SIMD-dispatch launcher; has unguarded main()
+        "main.cpp",            // CLI entry point
+        "bwtindex.cpp",        // index builder; out of scope (users run bwa-mem3 index)
+        "runsimd.cpp",         // runtime SIMD-dispatch launcher; has unguarded main()
+        "bam_writer.cpp",      // bwa-mem3 CLI's htslib-based BAM writer; shim has its own
+        "meth_bam.cpp",        // bisulfite BAM writer; htslib-dependent, out of scope
+        "fm_index_writer.cpp", // index builder
+        "index_prelude.cpp",   // index builder helper
+        "libsais_build.cpp",   // index builder (libsais)
     ];
     // fastmap.cpp used to be excluded (CLI-side batch driver) but is now
     // built to expose worker_alloc/worker_free. Its entry point is
@@ -190,10 +195,17 @@ fn apply_simd_flags(build: &mut cc::Build) {
         }
         "aarch64" => {
             build.flag_if_supported("-march=armv8-a+simd");
-            // Tell upstream's preprocessor to take the SSE2/SSE4.1 fallback path
-            // (not the AVX-512 branch). sse2neon provides the intrinsics.
+            // Mirror upstream's Makefile SSE2NEON_FLAGS so sse2neon-translated
+            // code paths (incl. SSSE3-gated banded-SW kernels) compile in.
+            // TODO: if a future bwa-mem3 TU starts using _mm_crc32_*
+            // (gated on __SSE4_2__), aarch64 will need `-march=armv8-a+crc`.
+            // Not required by the current vendored snapshot.
+            build.define("__SSE__", Some("1"));
             build.define("__SSE2__", Some("1"));
+            build.define("__SSE3__", Some("1"));
+            build.define("__SSSE3__", Some("1"));
             build.define("__SSE4_1__", Some("1"));
+            build.define("__SSE4_2__", Some("1"));
         }
         other => panic!("unsupported target arch: {other}"),
     }

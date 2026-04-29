@@ -6,7 +6,7 @@
  *
  * Keep the layouts byte-identical to bwa-mem3's. When refreshing the
  * vendored snapshot, diff against `vendor/bwa-mem3/src/bwamem.h` around
- * lines 76-108 (mem_opt_t) and 162-166 (mem_pestat_t); if either changed,
+ * lines 77-115 (mem_opt_t) and 172-176 (mem_pestat_t); if either changed,
  * update here.
  */
 #ifndef BWA_SHIM_TYPES_H
@@ -26,8 +26,9 @@
 #define MEM_F_SMARTPE        0x400
 #define MEM_F_PRIMARY5       0x800
 #define MEM_F_KEEP_SUPP_MAPQ 0x1000
+#define MEM_F_XB             0x2000
 
-/* Mirror of bwamem.h:76-108. Layout must match exactly. */
+/* Mirror of bwamem.h:77-115. Layout must match exactly. */
 typedef struct mem_opt_t {
     int a, b;
     int o_del, e_del;
@@ -60,9 +61,15 @@ typedef struct mem_opt_t {
     int max_matesw;
     int max_XA_hits, max_XA_hits_alt;
     int8_t mat[25];
+    int    bam_mode;
+    int    bam_level;
+    int    meth_mode;
+    char   meth_set_as_failed;
+    int    meth_no_chim;
+    int    supp_rep_hard_cap;
 } mem_opt_t;
 
-/* Mirror of bwamem.h:162-166. */
+/* Mirror of bwamem.h:172-176. */
 typedef struct mem_pestat_t {
     int low, high;
     int failed;

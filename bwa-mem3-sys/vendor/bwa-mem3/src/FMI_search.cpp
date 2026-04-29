@@ -27,365 +27,217 @@
 Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@intel.com>;
 *****************************************************************************************/
 
+#include <errno.h>
 #include <stdio.h>
-#include "sais.h"
+#include <stdlib.h>
+#include <inttypes.h>
+#include <climits>
+#include <sys/mman.h>     /* munmap */
+#include "bwa_madvise.h"
+#include "bwa_shm.h"
 #include "FMI_search.h"
 #include "memcpy_bwamem.h"
 #include "profiling.h"
+#include "libsais_build.h"
 
 #include "safestringlib.h"
 
 FMI_search::FMI_search(const char *fname)
 {
     fprintf(stderr, "* Entering FMI_search\n");
-    //strcpy(file_name, fname);
     strcpy_s(file_name, PATH_MAX, fname);
     reference_seq_len = 0;
     sentinel_index = 0;
-    index_alloc = 0;
     sa_ls_word = NULL;
     sa_ms_byte = NULL;
     cp_occ = NULL;
-    one_hot_mask_array = NULL;
+    shm_base = NULL;
+    shm_len = 0;
+
+    /* one_hot_mask_array is constant across the FMI's lifetime and is
+     * identical on disk and shm paths; initialize it once at construction. */
+    int64_t one_hot_bytes = 64 * (int64_t)sizeof(uint64_t);
+    one_hot_mask_array = (uint64_t *)_mm_malloc(one_hot_bytes, 64);
+    assert_not_null(one_hot_mask_array, one_hot_bytes, one_hot_bytes);
+    one_hot_mask_array[0] = 0;
+    uint64_t base = 0x8000000000000000L;
+    one_hot_mask_array[1] = base;
+    for (int64_t i = 2; i < 64; ++i) {
+        one_hot_mask_array[i] = (one_hot_mask_array[i - 1] >> 1) | base;
+    }
 }
 
 FMI_search::~FMI_search()
 {
-    if(sa_ms_byte)
-        _mm_free(sa_ms_byte);
-    if(sa_ls_word)
-        _mm_free(sa_ls_word);
-    if(cp_occ)
-        _mm_free(cp_occ);
-    if(one_hot_mask_array)
-        _mm_free(one_hot_mask_array);
+    /* When attached from shm, cp_occ/sa_*_byte/sa_*_word alias mmap'd pages
+     * owned by the shm segment, so we don't _mm_free them. We do munmap the
+     * mapping itself — leaving it would leak VA in long-lived processes that
+     * construct and destroy FMI_search repeatedly. */
+    if (shm_base != NULL) {
+        munmap(shm_base, shm_len);
+        shm_base = NULL;
+        shm_len  = 0;
+    } else {
+        if (sa_ms_byte) _mm_free(sa_ms_byte);
+        if (sa_ls_word) _mm_free(sa_ls_word);
+        if (cp_occ)     _mm_free(cp_occ);
+    }
+    if (one_hot_mask_array) _mm_free(one_hot_mask_array);
 }
 
-int64_t FMI_search::pac_seq_len(const char *fn_pac)
+int64_t FMI_search::cp_occ_size_bytes() const {
+    return ((reference_seq_len >> CP_SHIFT) + 1) * (int64_t)sizeof(CP_OCC);
+}
+
+int64_t FMI_search::sa_sample_count() const {
+    return (reference_seq_len >> SA_COMPX) + 1;
+}
+
+void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
 {
-	FILE *fp;
-	int64_t pac_len;
-	uint8_t c;
-	fp = xopen(fn_pac, "rb");
-	err_fseek(fp, -1, SEEK_END);
-	pac_len = err_ftell(fp);
-	err_fread_noeof(&c, 1, 1, fp);
-	err_fclose(fp);
-	return (pac_len - 1) * 4 + (int)c;
-}
+    if (base == NULL) {
+        fprintf(stderr, "ERROR! load_index_from_shm called with NULL base\n");
+        exit(EXIT_FAILURE);
+    }
+    uint64_t off = 0, sz = 0;
 
-void FMI_search::pac2nt(const char *fn_pac, std::string &reference_seq)
-{
-	uint8_t *buf2;
-	int64_t i, pac_size, seq_len;
-	FILE *fp;
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SCALARS, &off, &sz) != 0
+        || sz != BWA_SHM_FMI_SCALARS_BYTES) {
+        fprintf(stderr, "ERROR! shm segment missing or malformed FMI_SCALARS\n");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(&reference_seq_len, base + off,                                    sizeof(int64_t));
+    memcpy(count,              base + off + sizeof(int64_t),                  sizeof(int64_t) * 5);
+    memcpy(&sentinel_index,    base + off + sizeof(int64_t) * 6,              sizeof(int64_t));
 
-	// initialization
-	seq_len = pac_seq_len(fn_pac);
-    assert(seq_len > 0);
-    assert(seq_len <= 0x7fffffffffL);
-	fp = xopen(fn_pac, "rb");
-
-	// prepare sequence
-	pac_size = (seq_len>>2) + ((seq_len&3) == 0? 0 : 1);
-	buf2 = (uint8_t*)calloc(pac_size, 1);
-    assert(buf2 != NULL);
-	err_fread_noeof(buf2, 1, pac_size, fp);
-	err_fclose(fp);
-	for (i = 0; i < seq_len; ++i) {
-		int nt = buf2[i>>2] >> ((3 - (i&3)) << 1) & 3;
-        switch(nt)
-        {
-            case 0:
-                reference_seq += "A";
-            break;
-            case 1:
-                reference_seq += "C";
-            break;
-            case 2:
-                reference_seq += "G";
-            break;
-            case 3:
-                reference_seq += "T";
-            break;
-            default:
-                fprintf(stderr, "ERROR! Value of nt is not in 0,1,2,3!");
-                exit(EXIT_FAILURE);
-        }
-	}
-    for(i = seq_len - 1; i >= 0; i--)
-    {
-        char c = reference_seq[i];
-        switch(c)
-        {
-            case 'A':
-                reference_seq += "T";
-            break;
-            case 'C':
-                reference_seq += "G";
-            break;
-            case 'G':
-                reference_seq += "C";
-            break;
-            case 'T':
-                reference_seq += "A";
-            break;
+    /* Validate scalars before we use reference_seq_len in cp_occ_size_bytes()
+     * and the SA size accessors. Bounds match the disk path's asserts in
+     * load_index() and the writer-side checks in bwa_shm_compute(). A corrupt
+     * segment would otherwise drive negative or overflowing section sizes. */
+    if (reference_seq_len <= 0 || reference_seq_len > 0x7fffffffffLL) {
+        fprintf(stderr,
+            "ERROR! shm FMI_SCALARS: reference_seq_len=%lld out of bounds\n",
+            (long long)reference_seq_len);
+        exit(EXIT_FAILURE);
+    }
+    /* count[] is +1-adjusted by bwa_shm_compute; range [1, ref_seq_len+1]. */
+    for (int i = 0; i < 5; ++i) {
+        if (count[i] < 0 || count[i] > reference_seq_len + 1) {
+            fprintf(stderr,
+                "ERROR! shm FMI_SCALARS: count[%d]=%lld out of bounds (ref_seq_len=%lld)\n",
+                i, (long long)count[i], (long long)reference_seq_len);
+            exit(EXIT_FAILURE);
         }
     }
-	free(buf2);
-}
-
-int FMI_search::build_fm_index(const char *ref_file_name, char *binary_seq, int64_t ref_seq_len, int64_t *sa_bwt, int64_t *count) {
-    printf("ref_seq_len = %ld\n", ref_seq_len);
-    fflush(stdout);
-
-    char outname[PATH_MAX];
-
-    strcpy_s(outname, PATH_MAX, ref_file_name);
-    strcat_s(outname, PATH_MAX, CP_FILENAME_SUFFIX);
-    //sprintf(outname, "%s.bwt.2bit.%d", ref_file_name, CP_BLOCK_SIZE);
-
-    std::fstream outstream (outname, std::ios::out | std::ios::binary);
-    outstream.seekg(0);	
-
-    printf("count = %ld, %ld, %ld, %ld, %ld\n", count[0], count[1], count[2], count[3], count[4]);
-    fflush(stdout);
-
-    uint8_t *bwt;
-
-    ref_seq_len++;
-    outstream.write((char *)(&ref_seq_len), 1 * sizeof(int64_t));
-    outstream.write((char*)count, 5 * sizeof(int64_t));
-
-    int64_t i;
-    int64_t ref_seq_len_aligned = ((ref_seq_len + CP_BLOCK_SIZE - 1) / CP_BLOCK_SIZE) * CP_BLOCK_SIZE;
-    int64_t size = ref_seq_len_aligned * sizeof(uint8_t);
-    bwt = (uint8_t *)_mm_malloc(size, 64);
-    assert_not_null(bwt, size, index_alloc);
-
-    int64_t sentinel_index = -1;
-    for(i=0; i< ref_seq_len; i++)
-    {
-        if(sa_bwt[i] == 0)
-        {
-            bwt[i] = 4;
-            printf("BWT[%ld] = 4\n", i);
-            sentinel_index = i;
-        }
-        else
-        {
-            char c = binary_seq[sa_bwt[i]-1];
-            switch(c)
-            {
-                case 0: bwt[i] = 0;
-                          break;
-                case 1: bwt[i] = 1;
-                          break;
-                case 2: bwt[i] = 2;
-                          break;
-                case 3: bwt[i] = 3;
-                          break;
-                default:
-                        fprintf(stderr, "ERROR! i = %ld, c = %c\n", i, c);
-                        exit(EXIT_FAILURE);
-            }
-        }
+    if (sentinel_index < 0 || sentinel_index >= reference_seq_len) {
+        fprintf(stderr,
+            "ERROR! shm FMI_SCALARS: sentinel_index=%lld out of bounds (ref_seq_len=%lld)\n",
+            (long long)sentinel_index, (long long)reference_seq_len);
+        exit(EXIT_FAILURE);
     }
-    for(i = ref_seq_len; i < ref_seq_len_aligned; i++)
-        bwt[i] = DUMMY_CHAR;
 
-
-    printf("CP_SHIFT = %d, CP_MASK = %d\n", CP_SHIFT, CP_MASK);
-    printf("sizeof CP_OCC = %ld\n", sizeof(CP_OCC));
-    fflush(stdout);
-    // create checkpointed occ
-    int64_t cp_occ_size = (ref_seq_len >> CP_SHIFT) + 1;
-    CP_OCC *cp_occ = NULL;
-
-    size = cp_occ_size * sizeof(CP_OCC);
-    cp_occ = (CP_OCC *)_mm_malloc(size, 64);
-    assert_not_null(cp_occ, size, index_alloc);
-    memset(cp_occ, 0, cp_occ_size * sizeof(CP_OCC));
-    int64_t cp_count[16];
-
-    memset(cp_count, 0, 16 * sizeof(int64_t));
-    for(i = 0; i < ref_seq_len; i++)
-    {
-        if((i & CP_MASK) == 0)
-        {
-            CP_OCC cpo;
-            cpo.cp_count[0] = cp_count[0];
-            cpo.cp_count[1] = cp_count[1];
-            cpo.cp_count[2] = cp_count[2];
-            cpo.cp_count[3] = cp_count[3];
-
-			int32_t j;
-            cpo.one_hot_bwt_str[0] = 0;
-            cpo.one_hot_bwt_str[1] = 0;
-            cpo.one_hot_bwt_str[2] = 0;
-            cpo.one_hot_bwt_str[3] = 0;
-
-			for(j = 0; j < CP_BLOCK_SIZE; j++)
-			{
-                cpo.one_hot_bwt_str[0] = cpo.one_hot_bwt_str[0] << 1;
-                cpo.one_hot_bwt_str[1] = cpo.one_hot_bwt_str[1] << 1;
-                cpo.one_hot_bwt_str[2] = cpo.one_hot_bwt_str[2] << 1;
-                cpo.one_hot_bwt_str[3] = cpo.one_hot_bwt_str[3] << 1;
-				uint8_t c = bwt[i + j];
-                //printf("c = %d\n", c);
-                if(c < 4)
-                {
-                    cpo.one_hot_bwt_str[c] += 1;
-                }
-			}
-
-            cp_occ[i >> CP_SHIFT] = cpo;
-        }
-        cp_count[bwt[i]]++;
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_OCC, &off, &sz) != 0
+        || (int64_t)sz != cp_occ_size_bytes()) {
+        fprintf(stderr, "ERROR! shm segment missing or sized FMI_CP_OCC\n");
+        exit(EXIT_FAILURE);
     }
-    outstream.write((char*)cp_occ, cp_occ_size * sizeof(CP_OCC));
-    _mm_free(cp_occ);
-    _mm_free(bwt);
+    cp_occ = (CP_OCC *)(base + off);
 
-    #if SA_COMPRESSION  
-
-    size = ((ref_seq_len >> SA_COMPX)+ 1)  * sizeof(uint32_t);
-    uint32_t *sa_ls_word = (uint32_t *)_mm_malloc(size, 64);
-    assert_not_null(sa_ls_word, size, index_alloc);
-    size = ((ref_seq_len >> SA_COMPX) + 1) * sizeof(int8_t);
-    int8_t *sa_ms_byte = (int8_t *)_mm_malloc(size, 64);
-    assert_not_null(sa_ms_byte, size, index_alloc);
-    int64_t pos = 0;
-    for(i = 0; i < ref_seq_len; i++)
-    {
-        if ((i & SA_COMPX_MASK) == 0)
-        {
-            sa_ls_word[pos] = sa_bwt[i] & 0xffffffff;
-            sa_ms_byte[pos] = (sa_bwt[i] >> 32) & 0xff;
-            pos++;
-        }
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SA_MS, &off, &sz) != 0
+        || (int64_t)sz != sa_ms_byte_size_bytes()) {
+        fprintf(stderr, "ERROR! shm segment missing or sized FMI_SA_MS\n");
+        exit(EXIT_FAILURE);
     }
-    fprintf(stderr, "pos: %d, ref_seq_len__: %ld\n", pos, ref_seq_len >> SA_COMPX);
-    outstream.write((char*)sa_ms_byte, ((ref_seq_len >> SA_COMPX) + 1) * sizeof(int8_t));
-    outstream.write((char*)sa_ls_word, ((ref_seq_len >> SA_COMPX) + 1) * sizeof(uint32_t));
-    
-    #else
-    
-    size = ref_seq_len * sizeof(uint32_t);
-    uint32_t *sa_ls_word = (uint32_t *)_mm_malloc(size, 64);
-    assert_not_null(sa_ls_word, size, index_alloc);
-    size = ref_seq_len * sizeof(int8_t);
-    int8_t *sa_ms_byte = (int8_t *)_mm_malloc(size, 64);
-    assert_not_null(sa_ms_byte, size, index_alloc);
-    for(i = 0; i < ref_seq_len; i++)
-    {
-        sa_ls_word[i] = sa_bwt[i] & 0xffffffff;
-        sa_ms_byte[i] = (sa_bwt[i] >> 32) & 0xff;
+    sa_ms_byte = (int8_t *)(base + off);
+
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SA_LS, &off, &sz) != 0
+        || (int64_t)sz != sa_ls_word_size_bytes()) {
+        fprintf(stderr, "ERROR! shm segment missing or sized FMI_SA_LS\n");
+        exit(EXIT_FAILURE);
     }
-    outstream.write((char*)sa_ms_byte, ref_seq_len * sizeof(int8_t));
-    outstream.write((char*)sa_ls_word, ref_seq_len * sizeof(uint32_t));
-    
-    #endif
+    sa_ls_word = (uint32_t *)(base + off);
 
-    outstream.write((char *)(&sentinel_index), 1 * sizeof(int64_t));
-    outstream.close();
-    printf("max_occ_ind = %ld\n", i >> CP_SHIFT);    
-    fflush(stdout);
+    shm_base = base;
+    shm_len  = len;
 
-    _mm_free(sa_ms_byte);
-    _mm_free(sa_ls_word);
-    return 0;
+    fprintf(stderr, "* FMI attached from shm: ref_seq_len=%ld sentinel_index=%ld\n",
+            (long)reference_seq_len, (long)sentinel_index);
 }
 
 int FMI_search::build_index() {
 
     char *prefix = file_name;
-    uint64_t startTick;
-    startTick = __rdtsc();
-    index_alloc = 0;
 
-    std::string reference_seq;
-    char pac_file_name[PATH_MAX];
-    strcpy_s(pac_file_name, PATH_MAX, prefix);
-    strcat_s(pac_file_name, PATH_MAX, ".pac");
-    //sprintf(pac_file_name, "%s.pac", prefix);
-    pac2nt(pac_file_name, reference_seq);
-	int64_t pac_len = reference_seq.length();
-    int status;
-    int64_t size = pac_len * sizeof(char);
-    char *binary_ref_seq = (char *)_mm_malloc(size, 64);
-    index_alloc += size;
-    assert_not_null(binary_ref_seq, size, index_alloc);
-    char binary_ref_name[PATH_MAX];
-    strcpy_s(binary_ref_name, PATH_MAX, prefix);
-    strcat_s(binary_ref_name, PATH_MAX, ".0123");
-    //sprintf(binary_ref_name, "%s.0123", prefix);
-    std::fstream binary_ref_stream (binary_ref_name, std::ios::out | std::ios::binary);
-    binary_ref_stream.seekg(0);
-    fprintf(stderr, "init ticks = %llu\n", __rdtsc() - startTick);
-    startTick = __rdtsc();
-    int64_t i, count[16];
-	memset(count, 0, sizeof(int64_t) * 16);
-    for(i = 0; i < pac_len; i++)
-    {
-        switch(reference_seq[i])
-        {
-            case 'A':
-            binary_ref_seq[i] = 0, ++count[0];
-            break;
-            case 'C':
-            binary_ref_seq[i] = 1, ++count[1];
-            break;
-            case 'G':
-            binary_ref_seq[i] = 2, ++count[2];
-            break;
-            case 'T':
-            binary_ref_seq[i] = 3, ++count[3];
-            break;
-            default:
-            binary_ref_seq[i] = 4;
-
-        }
+    // Read single-strand length from .ann to compute doubled pac_len.
+    char ann_path[PATH_MAX];
+    strcpy_s(ann_path, PATH_MAX, prefix);
+    strcat_s(ann_path, PATH_MAX, ".ann");
+    FILE* fann = fopen(ann_path, "r");
+    if (fann == NULL) {
+        fprintf(stderr, "ERROR: cannot open '%s'\n", ann_path);
+        return 1;
     }
-    count[4]=count[0]+count[1]+count[2]+count[3];
-    count[3]=count[0]+count[1]+count[2];
-    count[2]=count[0]+count[1];
-    count[1]=count[0];
-    count[0]=0;
-    fprintf(stderr, "ref seq len = %ld\n", pac_len);
-    binary_ref_stream.write(binary_ref_seq, pac_len * sizeof(char));
-    fprintf(stderr, "binary seq ticks = %llu\n", __rdtsc() - startTick);
-    startTick = __rdtsc();
+    int64_t l_pac = 0;
+    int n_seqs = 0, seed = 0;
+    if (fscanf(fann, "%" SCNd64 " %d %d", &l_pac, &n_seqs, &seed) != 3) {
+        fprintf(stderr, "ERROR: malformed '%s'\n", ann_path);
+        fclose(fann);
+        return 1;
+    }
+    fclose(fann);
+    // Defensive: a non-positive l_pac (corrupt or zero-length .ann) would
+    // pass a bad pac_len into libsais and only fail much later. Catch it
+    // up front with an actionable message, mirroring bntseq_restore_core.
+    if (l_pac <= 0 || n_seqs < 0) {
+        fprintf(stderr, "ERROR: malformed '%s' (l_pac=%" PRId64 ", n_seqs=%d)\n",
+                ann_path, l_pac, n_seqs);
+        return 1;
+    }
+    int64_t pac_len = 2 * l_pac;
 
-    size = (pac_len + 2) * sizeof(int64_t);
-    int64_t *suffix_array=(int64_t *)_mm_malloc(size, 64);
-    index_alloc += size;
-    assert_not_null(suffix_array, size, index_alloc);
-    startTick = __rdtsc();
-	//status = saisxx<const char *, int64_t *, int64_t>(reference_seq.c_str(), suffix_array + 1, pac_len, 4);
-	status = saisxx(reference_seq.c_str(), suffix_array + 1, pac_len);
-	suffix_array[0] = pac_len;
-    fprintf(stderr, "build suffix-array ticks = %llu\n", __rdtsc() - startTick);
-    startTick = __rdtsc();
-
-	build_fm_index(prefix, binary_ref_seq, pac_len, suffix_array, count);
-    fprintf(stderr, "build fm-index ticks = %llu\n", __rdtsc() - startTick);
-    _mm_free(binary_ref_seq);
-    _mm_free(suffix_array);
-    return 0;
+    auto parse_ll = [](const char* s, const char* name,
+                       long long max_val = LLONG_MAX) -> long long {
+        char* end = nullptr;
+        errno = 0;
+        long long v = strtoll(s, &end, 10);
+        if (errno || end == s || *end != '\0' || v <= 0 || v > max_val) {
+            fprintf(stderr, "ERROR: invalid %s='%s' (expected positive integer)\n",
+                    name, s);
+            exit(1);
+        }
+        return v;
+    };
+    LibsaisBuildOpts opts;
+    if (const char* th = getenv("BWA_INDEX_THREADS"))
+        opts.num_threads      = (int)parse_ll(th, "BWA_INDEX_THREADS", INT_MAX);
+    if (const char* mm = getenv("BWA_INDEX_MAX_MEMORY"))
+        opts.max_memory_bytes = parse_ll(mm, "BWA_INDEX_MAX_MEMORY");
+    if (const char* td = getenv("BWA_INDEX_TMPDIR"))
+        opts.tmpdir           = td;
+    return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
 void FMI_search::load_index()
 {
-    one_hot_mask_array = (uint64_t *)_mm_malloc(64 * sizeof(uint64_t), 64);
-    one_hot_mask_array[0] = 0;
-    uint64_t base = 0x8000000000000000L;
-    one_hot_mask_array[1] = base;
-    int64_t i = 0;
-    for(i = 2; i < 64; i++)
+    /* Try the staged shm segment first. On hit, both the FMI internals
+     * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
+     * mapping; the segment lifetime belongs to the shm-loading process. */
     {
-        one_hot_mask_array[i] = (one_hot_mask_array[i - 1] >> 1) | base;
+        size_t   shm_attach_len = 0;
+        uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len);
+        if (shm_base_local != NULL) {
+            load_index_from_shm(shm_base_local, shm_attach_len);
+            bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len);
+            fprintf(stderr, "* FMI+BNS+PAC attached from shm; "
+                    "skipping disk load.\n");
+            return;
+        }
     }
+
+    // Running total of index bytes allocated so far in this function.
+    // Passed to assert_not_null so a failed allocation reports both the
+    // attempted size and how much we'd already committed before failing.
+    int64_t index_alloc = 0;
 
     char *ref_file_name = file_name;
     //beCalls = 0;
@@ -417,10 +269,11 @@ void FMI_search::load_index()
     cp_occ = NULL;
 
     err_fread_noeof(&count[0], sizeof(int64_t), 5, cpstream);
-    if ((cp_occ = (CP_OCC *)_mm_malloc(cp_occ_size * sizeof(CP_OCC), 64)) == NULL) {
-        fprintf(stderr, "ERROR! unable to allocated cp_occ memory\n");
-        exit(EXIT_FAILURE);
-    }
+    int64_t cp_occ_bytes = cp_occ_size * sizeof(CP_OCC);
+    cp_occ = (CP_OCC *)_mm_malloc(cp_occ_bytes, 64);
+    index_alloc += cp_occ_bytes;
+    assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
+    bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
 
     err_fread_noeof(cp_occ, sizeof(CP_OCC), cp_occ_size, cpstream);
     int64_t ii = 0;
@@ -432,15 +285,31 @@ void FMI_search::load_index()
     #if SA_COMPRESSION
 
     int64_t reference_seq_len_ = (reference_seq_len >> SA_COMPX) + 1;
-    sa_ms_byte = (int8_t *)_mm_malloc(reference_seq_len_ * sizeof(int8_t), 64);
-    sa_ls_word = (uint32_t *)_mm_malloc(reference_seq_len_ * sizeof(uint32_t), 64);
+    int64_t sa_ms_bytes = reference_seq_len_ * sizeof(int8_t);
+    int64_t sa_ls_bytes = reference_seq_len_ * sizeof(uint32_t);
+    sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
+    index_alloc += sa_ms_bytes;
+    assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
+    sa_ls_word = (uint32_t *)_mm_malloc(sa_ls_bytes, 64);
+    index_alloc += sa_ls_bytes;
+    assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
+    bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
+    bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
     err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len_, cpstream);
     err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len_, cpstream);
-    
+
     #else
-    
-    sa_ms_byte = (int8_t *)_mm_malloc(reference_seq_len * sizeof(int8_t), 64);
-    sa_ls_word = (uint32_t *)_mm_malloc(reference_seq_len * sizeof(uint32_t), 64);
+
+    int64_t sa_ms_bytes = reference_seq_len * sizeof(int8_t);
+    int64_t sa_ls_bytes = reference_seq_len * sizeof(uint32_t);
+    sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
+    index_alloc += sa_ms_bytes;
+    assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
+    sa_ls_word = (uint32_t *)_mm_malloc(sa_ls_bytes, 64);
+    index_alloc += sa_ls_bytes;
+    assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
+    bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
+    bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
     err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len, cpstream);
     err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len, cpstream);
 
@@ -501,7 +370,11 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                                          int64_t *__numTotalSmem)
 {
     int64_t numTotalSmem = *__numTotalSmem;
-    SMEM prevArray[max_readlength];
+    // Heap-allocate to avoid stack overflow on long reads (PacBio HiFi /
+    // ONT 1 Mbp+); mirrors the lockstep path's max_readlength sizing.
+    int64_t prevArray_bytes = (int64_t)max_readlength * sizeof(SMEM);
+    SMEM *prevArray = (SMEM *)_mm_malloc((size_t)prevArray_bytes, 64);
+    assert_not_null(prevArray, prevArray_bytes, prevArray_bytes);
 
     uint32_t i;
     // Perform SMEM for original reads
@@ -661,7 +534,292 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
         query_pos_array[i] = next_x;
     }
     (*__numTotalSmem) = numTotalSmem;
+    _mm_free(prevArray);
 }
+
+// ===== Lockstep SMEM batching =====
+// Per-slot state for the lockstep SMEM walk. One instance per in-flight read
+// in the batch. Every field mirrors a per-read local in the scalar
+// getSMEMsOnePosOneThread body, so parity with the scalar path follows from
+// composing the existing primitives (backwardExt, count[], cp_occ) in the
+// same sequence the scalar would.
+//
+// The prev[] and match_buf[] buffers are heap-allocated by the driver
+// (getSMEMsOnePosOneThread_lockstep), sized from the batch's
+// max_readlength. No compile-time cap — long reads (PacBio HiFi, ONT)
+// fit cleanly.
+
+enum LockstepPhase : uint8_t {
+    PH_FWD      = 0,  // forward extension inner loop active
+    PH_BWD_INIT = 1,  // between-phases housekeeping pending
+    PH_BWD      = 2,  // backward search outer loop active
+    PH_DONE     = 3   // slot finished; match_buf ready for flush
+};
+
+// LISA trick #4: hybrid SoA. The per-slot "hot" state stays compact
+// (~80 bytes) so cross-slot access (e.g. T1 prefetch lookahead against
+// slots[(s+N/2)%N]) hits a tight L1-resident array instead of jumping
+// 32KB strides across embedded buffers. The bulk arrays (prev[],
+// match_buf[]; ~32 KB each) live in separate per-slot allocations,
+// referenced by pointer. Accessor syntax (s->prev[i], s->match_buf[i])
+// is unchanged from the embedded-array version.
+struct FMI_search::BatchSlot {
+    // Input identity — copied at init, never mutated thereafter.
+    int32_t input_idx;           // index into the caller's input arrays
+    int32_t rid;                 // rid_array[input_idx]
+    int16_t start_pos;           // query_pos_array[input_idx] (saved for bwd init)
+    int32_t min_intv;            // min_intv_array[input_idx]
+    int32_t readlength;          // seq_[rid].l_seq
+    int32_t offset;              // query_cum_len_ar[rid]
+
+    // Output for query_pos_array[input_idx] write-back at flush time.
+    int16_t next_x;
+
+    // Walk state (mirrors scalar locals).
+    SMEM smem;                   // current SA interval
+    int32_t j;                   // current query position in the active phase's inner loop
+    int32_t cur_j;               // backward phase bookkeeping (scalar's cur_j)
+    LockstepPhase phase;
+
+    // Per-slot bulk-buffer state.
+    int32_t numPrev;
+    int32_t match_count;
+    bool    ready;
+
+    // Pointers into per-slot bulk arrays (allocated by the driver, sized
+    // by max_readlength).
+    SMEM    *prev;
+    SMEM    *match_buf;
+};
+
+void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
+{
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#else
+    (void)s;
+#endif
+}
+
+/* T1 (L2) variant — used for cross-slot N/2-step lookahead. The T0 prefetch
+ * above lands at "this slot's next step" granularity; T1 here lands at
+ * "this slot's step ~N/2 from now". For N=8 that's 4 stepping-passes ahead,
+ * giving DRAM-latency-class lookahead when the cp_occ working set spills
+ * out of L2/L3. */
+void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
+{
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+#else
+    (void)s;
+#endif
+}
+
+// Populate a slot from the caller's input arrays at the given input_idx.
+// After this call either:
+//   phase == PH_FWD  — slot is ready to step the forward-extension inner loop
+//   phase == PH_DONE — the first base is non-ACGT; scalar skips this read, so
+//                      we match that (zero matches emitted, ready to flush).
+void FMI_search::ls_init_slot(BatchSlot *s,
+                              int32_t input_idx,
+                              const int16_t *query_pos_array,
+                              const int32_t *min_intv_array,
+                              const int32_t *rid_array,
+                              const bseq1_t *seq_,
+                              const int32_t *query_cum_len_ar,
+                              const uint8_t *enc_qdb)
+{
+    s->input_idx   = input_idx;
+    s->rid         = rid_array[input_idx];
+    s->start_pos   = query_pos_array[input_idx];
+    s->min_intv    = min_intv_array[input_idx];
+    s->readlength  = seq_[s->rid].l_seq;
+    s->offset      = query_cum_len_ar[s->rid];
+    s->next_x      = s->start_pos + 1;
+    s->numPrev     = 0;
+    s->match_count = 0;
+    s->ready       = false;
+
+    int32_t x = s->start_pos;
+    uint8_t a = enc_qdb[s->offset + x];
+    if (a < 4) {
+        s->smem.rid = s->rid;
+        s->smem.m   = x;
+        s->smem.n   = x;
+        s->smem.k   = count[a];
+        s->smem.l   = count[3 - a];
+        s->smem.s   = count[a + 1] - count[a];
+        s->j        = x + 1;
+        s->phase    = PH_FWD;
+    } else {
+        // Scalar path skips the whole read when the first base is N.
+        // Match that by going straight to DONE with zero matches.
+        s->phase = PH_DONE;
+        s->ready = true;
+    }
+}
+// Advance one slot through one step of forward extension.
+// Mirrors the inner j-loop body of the scalar getSMEMsOnePosOneThread
+// (src/FMI_search.cpp — the for(j = x+1; j < readlength; j++) loop).
+// On the step that exits forward-ext (end-of-read, non-ACGT at j, or
+// s < min_intv), transitions phase to PH_BWD_INIT.
+void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
+{
+    if (s->j >= s->readlength) {
+        // Ran off the end of the read; keep the still-valid smem if any.
+        if (s->smem.s >= s->min_intv) {
+            s->prev[s->numPrev++] = s->smem;
+        }
+        s->phase = PH_BWD_INIT;
+        return;
+    }
+
+    uint8_t a = enc_qdb[s->offset + s->j];
+    s->next_x = s->j + 1;
+    if (a >= 4) {
+        // Non-ACGT base terminates forward ext.
+        if (s->smem.s >= s->min_intv) {
+            s->prev[s->numPrev++] = s->smem;
+        }
+        s->phase = PH_BWD_INIT;
+        return;
+    }
+
+    SMEM smem_ = s->smem;
+    smem_.k = s->smem.l;
+    smem_.l = s->smem.k;
+    SMEM newSmem_ = backwardExt(smem_, 3 - a);
+    SMEM newSmem  = newSmem_;
+    newSmem.k = newSmem_.l;
+    newSmem.l = newSmem_.k;
+    newSmem.n = s->j;
+
+    int32_t s_neq_mask = (newSmem.s != s->smem.s);
+    s->prev[s->numPrev] = s->smem;
+    s->numPrev += s_neq_mask;
+
+    if (newSmem.s < s->min_intv) {
+        s->next_x = s->j;
+        s->phase = PH_BWD_INIT;
+        return;
+    }
+
+    s->smem = newSmem;
+    s->j++;
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+}
+
+// Between-phases housekeeping: reverse prev[] and set up backward-phase
+// cursors. After this call the slot is either PH_BWD (ready for
+// ls_advance_backward_step) or PH_DONE (nothing to do — backward outer
+// loop would terminate on the first step, so we short-circuit to the
+// final prev[0] emit and done).
+void FMI_search::ls_prepare_backward(BatchSlot *s)
+{
+    // Reverse prev[] in place (matches scalar behavior before backward loop).
+    for (int p = 0; p < (s->numPrev / 2); p++) {
+        SMEM tmp = s->prev[p];
+        s->prev[p] = s->prev[s->numPrev - p - 1];
+        s->prev[s->numPrev - p - 1] = tmp;
+    }
+    s->cur_j = s->readlength;
+    s->j = s->start_pos - 1;  // first position for the backward outer loop
+
+    if (s->numPrev == 0) {
+        // Nothing to emit; scalar's final `if (numPrev != 0)` block is a no-op.
+        s->phase = PH_DONE;
+        s->ready = true;
+        return;
+    }
+    if (s->j < 0) {
+        // Backward outer loop cannot execute (start_pos == 0). Transition to
+        // PH_BWD so the first ls_advance_backward_step call sees j < 0, jumps
+        // to DONE, and runs the final prev[0] emit with the correct minSeedLen.
+        s->phase = PH_BWD;
+        return;
+    }
+    s->phase = PH_BWD;
+}
+
+// Advance one slot through ONE outer-j iteration of backward search.
+// Mirrors the body of the scalar `for (j = x-1; j >= 0; j--)` outer loop
+// in getSMEMsOnePosOneThread. On terminating conditions (numCurr == 0,
+// j < 0 after decrement, or non-ACGT at j), runs the scalar's final
+// prev[0] emit and transitions to PH_DONE.
+void FMI_search::ls_advance_backward_step(BatchSlot *s,
+                                          const uint8_t *enc_qdb,
+                                          int32_t minSeedLen)
+{
+    if (s->j < 0) goto DONE;
+
+    {
+        int32_t numCurr = 0;
+        int32_t curr_s = -1;
+        uint8_t a = enc_qdb[s->offset + s->j];
+        if (a > 3) goto DONE;
+
+        int p;
+        for (p = 0; p < s->numPrev; p++) {
+            SMEM smem = s->prev[p];
+            SMEM newSmem = backwardExt(smem, a);
+            newSmem.m = s->j;
+            if ((newSmem.s < s->min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
+                s->cur_j = s->j;
+                s->match_buf[s->match_count++] = smem;
+                break;
+            }
+            if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
+                curr_s = newSmem.s;
+                s->prev[numCurr++] = newSmem;
+#ifdef ENABLE_PREFETCH
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                break;
+            }
+        }
+        p++;
+        for (; p < s->numPrev; p++) {
+            SMEM smem = s->prev[p];
+            SMEM newSmem = backwardExt(smem, a);
+            newSmem.m = s->j;
+            if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
+                curr_s = newSmem.s;
+                s->prev[numCurr++] = newSmem;
+#ifdef ENABLE_PREFETCH
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+            }
+        }
+        s->numPrev = numCurr;
+        s->j--;                // advance for the next outer step
+        if (numCurr == 0) goto DONE;
+        return;                // stay in PH_BWD; next call continues
+    }
+
+DONE:
+    // Scalar end-of-function final prev[0] emit (lines ~650-659 of scalar).
+    if (s->numPrev != 0) {
+        SMEM smem = s->prev[0];
+        if ((smem.n - smem.m + 1) >= minSeedLen) {
+            s->match_buf[s->match_count++] = smem;
+        }
+        s->numPrev = 0;
+    }
+    s->phase = PH_DONE;
+    s->ready = true;
+}
+// ===== End lockstep SMEM batching =====
 
 void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          int32_t *min_intv_array,
@@ -676,7 +834,7 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          int64_t *__numTotalSmem)
 {
     int16_t *query_pos_array = (int16_t *)_mm_malloc(numReads * sizeof(int16_t), 64);
-    
+
     int32_t i;
     for(i = 0; i < numReads; i++)
         query_pos_array[i] = 0;
@@ -696,9 +854,23 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                 rid_array[tail] = rid_array[head];
                 query_pos_array[tail] = query_pos_array[head];
                 min_intv_array[tail] = min_intv_array[head];
-                tail++;             
-            }               
+                tail++;
+            }
         }
+#if SMEM_LOCKSTEP_N > 1
+        getSMEMsOnePosOneThread_lockstep(enc_qdb,
+                                         query_pos_array,
+                                         min_intv_array,
+                                         rid_array,
+                                         tail,
+                                         batch_size,
+                                         seq_,
+                                         query_cum_len_ar,
+                                         max_readlength,
+                                         minSeedLen,
+                                         matchArray,
+                                         __numTotalSmem);
+#else
         getSMEMsOnePosOneThread(enc_qdb,
                                 query_pos_array,
                                 min_intv_array,
@@ -711,10 +883,160 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                 minSeedLen,
                                 matchArray,
                                 __numTotalSmem);
+#endif
         numActive = tail;
     } while(numActive > 0);
 
     _mm_free(query_pos_array);
+}
+
+void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
+                                                   int16_t *query_pos_array,
+                                                   int32_t *min_intv_array,
+                                                   int32_t *rid_array,
+                                                   int32_t numReads,
+                                                   int32_t batch_size,
+                                                   const bseq1_t *seq_,
+                                                   int32_t *query_cum_len_ar,
+                                                   int32_t max_readlength,
+                                                   int32_t minSeedLen,
+                                                   SMEM *matchArray,
+                                                   int64_t *__numTotalSmem)
+{
+    (void)batch_size;
+
+    if (numReads == 0) return;
+
+    const int32_t N = SMEM_LOCKSTEP_N;
+    // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
+    // state (~80 B per slot, full array fits in 1-2 cache lines for N=8).
+    // Bulk per-slot buffers (prev/match_buf) live separately and are reused
+    // across calls via thread_local caches sized from the batch's
+    // max_readlength so reads of any length fit (see issue #44 / PR #55).
+    //
+    // The outer driver getSMEMsAllPosOneThread runs this in a do/while
+    // loop, so allocating per-call (~2*N*max_readlength*sizeof(SMEM) ≈
+    // 384 KB at N=8, max_readlength=1500) imposed measurable allocator
+    // pressure. Cache per-thread (so OMP workers don't share) and grow
+    // monotonically — max_readlength is bounded by the driver batch and
+    // increases rarely in practice.
+    //
+    // TODO(memory): the cache only grows. For mixed-length workloads (e.g.
+    // a single ONT-class read with max_readlength≈1e6 mid-stream — sized
+    // to ~640 MB per thread, ~10 GB across 16 OMP workers — followed by
+    // short reads), the high-water mark is held until thread/process exit.
+    // Acceptable for the smoke1M Illumina PE150 benchmark (max_readlength≈
+    // 150 → ~38 KB/thread). Revisit if a streaming aligner or long-running
+    // service pipeline appears: gate the realloc on a configured upper
+    // bound (e.g. MAX_SMEM_PER_SLOT) or shrink when cached_per_slot greatly
+    // exceeds the current batch. Also flagged by leak-sanitizer/Valgrind
+    // because the buffers are released only at process exit.
+    BatchSlot slots[SMEM_LOCKSTEP_N] = {};
+    static thread_local SMEM   *cached_prev  = NULL;
+    static thread_local SMEM   *cached_match = NULL;
+    static thread_local size_t  cached_per_slot = 0;
+    const size_t per_slot_smems = (size_t)max_readlength;
+    if (per_slot_smems > cached_per_slot) {
+        if (cached_prev  != NULL) _mm_free(cached_prev);
+        if (cached_match != NULL) _mm_free(cached_match);
+        const size_t total_slot_bytes = (size_t)N * per_slot_smems * sizeof(SMEM);
+        cached_prev  = (SMEM *)_mm_malloc(total_slot_bytes, 64);
+        assert_not_null(cached_prev, total_slot_bytes, total_slot_bytes);
+        cached_match = (SMEM *)_mm_malloc(total_slot_bytes, 64);
+        assert_not_null(cached_match, total_slot_bytes, (size_t)2 * total_slot_bytes);
+        cached_per_slot = per_slot_smems;
+    }
+    for (int32_t s = 0; s < N; s++) {
+        slots[s].prev      = cached_prev  + (size_t)s * cached_per_slot;
+        slots[s].match_buf = cached_match + (size_t)s * cached_per_slot;
+    }
+
+    // Seed the first min(N, numReads) slots.
+    int32_t initial = (numReads < N) ? numReads : N;
+    for (int32_t s = 0; s < initial; s++) {
+        ls_init_slot(&slots[s], s, query_pos_array, min_intv_array,
+                     rid_array, seq_, query_cum_len_ar, enc_qdb);
+        if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
+    }
+    // Any unused slots (numReads < N) are marked DONE with invalid input_idx
+    // so the stepping pass skips them and the flush pass ignores them.
+    for (int32_t s = initial; s < N; s++) {
+        slots[s].phase = PH_DONE;
+        slots[s].ready = false;
+        slots[s].input_idx = -1;
+    }
+
+    int32_t next_input   = initial;
+    int32_t flush_cursor = 0;
+    int64_t numTotalSmem = *__numTotalSmem;
+
+    while (flush_cursor < numReads) {
+        // --- Stepping pass: advance each non-DONE slot by one phase-step. ---
+        for (int32_t s = 0; s < N; s++) {
+            switch (slots[s].phase) {
+                case PH_FWD:
+                    ls_advance_forward_step(&slots[s], enc_qdb);
+                    // If forward just transitioned to PH_BWD_INIT, run the
+                    // between-phases housekeeping immediately. prepare_backward
+                    // may transition straight to PH_DONE (e.g. empty prev[]).
+                    if (slots[s].phase == PH_BWD_INIT) {
+                        ls_prepare_backward(&slots[s]);
+                    }
+                    break;
+                case PH_BWD_INIT:
+                    ls_prepare_backward(&slots[s]);
+                    break;
+                case PH_BWD:
+                    ls_advance_backward_step(&slots[s], enc_qdb, minSeedLen);
+                    break;
+                case PH_DONE:
+                    break;
+            }
+            // LISA trick #5: cross-slot T1 (L2) prefetch with N/2-step lookahead.
+            // The same-slot T0 prefetch issued inside ls_advance_*_step covers
+            // the next single-step access; this T1 prefetch on slot[s+N/2] keeps
+            // a copy in L2 for that slot's access ~N/2 stepping-passes from now,
+            // hiding DRAM-class latency when cp_occ entries spill out of L3.
+            const int32_t s_la = (s + (N / 2)) % N;
+            if (slots[s_la].phase == PH_FWD || slots[s_la].phase == PH_BWD) {
+                ls_prefetch_cp_occ_t1(&slots[s_la]);
+            }
+        }
+
+        // --- Flush pass: in-order emit + slot recycle. ---
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (int32_t s = 0; s < N; s++) {
+                if (slots[s].phase == PH_DONE &&
+                    slots[s].ready &&
+                    slots[s].input_idx == flush_cursor) {
+                    for (int32_t m = 0; m < slots[s].match_count; m++) {
+                        matchArray[numTotalSmem++] = slots[s].match_buf[m];
+                    }
+                    query_pos_array[slots[s].input_idx] = slots[s].next_x;
+                    flush_cursor++;
+
+                    if (next_input < numReads) {
+                        ls_init_slot(&slots[s], next_input,
+                                     query_pos_array, min_intv_array,
+                                     rid_array, seq_, query_cum_len_ar, enc_qdb);
+                        if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
+                        next_input++;
+                    } else {
+                        slots[s].input_idx = -1;  // retired
+                        slots[s].ready = false;
+                    }
+                    progress = true;
+                }
+            }
+        }
+    }
+
+    *__numTotalSmem = numTotalSmem;
+    /* prev/match buffers are owned by thread_local caches above; intentionally
+     * not freed here so the next call (same thread) reuses them without a
+     * round-trip through the allocator. The caches leak at thread/process exit. */
 }
 
 int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
@@ -815,8 +1137,11 @@ void FMI_search::getSMEMs(uint8_t *enc_qdb,
         SMEM *matchArray,
         int64_t *numTotalSmem)
 {
-    SMEM *prevArray = (SMEM *)_mm_malloc(nthreads * readlength * sizeof(SMEM), 64);
-    SMEM *currArray = (SMEM *)_mm_malloc(nthreads * readlength * sizeof(SMEM), 64);
+    const size_t smem_arr_bytes = (size_t)nthreads * (size_t)readlength * sizeof(SMEM);
+    SMEM *prevArray = (SMEM *)_mm_malloc(smem_arr_bytes, 64);
+    assert_not_null(prevArray, smem_arr_bytes, smem_arr_bytes);
+    SMEM *currArray = (SMEM *)_mm_malloc(smem_arr_bytes, 64);
+    assert_not_null(currArray, smem_arr_bytes, (size_t)2 * smem_arr_bytes);
 
 
 // #pragma omp parallel num_threads(nthreads)
@@ -824,7 +1149,7 @@ void FMI_search::getSMEMs(uint8_t *enc_qdb,
         int tid = 0; //omp_get_thread_num();   // removed omp
         numTotalSmem[tid] = 0;
         SMEM *myPrevArray = prevArray + tid * readlength;
-        SMEM *myCurrArray = prevArray + tid * readlength;
+        SMEM *myCurrArray = currArray + tid * readlength;
 
         int32_t perThreadQuota = (numReads + (nthreads - 1)) / nthreads;
         int32_t first = tid * perThreadQuota;
@@ -1059,11 +1384,18 @@ void FMI_search::get_sa_entries(int64_t *posArray, int64_t *coordArray, uint32_t
 // #pragma omp parallel for num_threads(nthreads)
     for(i = 0; i < count; i++)
     {
+        /* Prefetch the SAL slot SAL_PFD iterations ahead. Both
+         * sa_ms_byte and sa_ls_word are large random-access arrays
+         * (separate cache lines), so issue two prefetches per slot. */
+        if (i + SAL_PFD < count) {
+            int64_t pf_pos = posArray[i + SAL_PFD];
+            _mm_prefetch((const char *)(sa_ms_byte + pf_pos), _MM_HINT_T0);
+            _mm_prefetch((const char *)(sa_ls_word + pf_pos), _MM_HINT_T0);
+        }
         int64_t pos = posArray[i];
         int64_t sa_entry = sa_ms_byte[pos];
         sa_entry = sa_entry << 32;
         sa_entry = sa_entry + sa_ls_word[pos];
-        //_mm_prefetch((const char *)(sa_ms_byte + pos + SAL_PFD), _MM_HINT_T0);
         coordArray[i] = sa_entry;
     }
 }
@@ -1082,10 +1414,16 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
         for(j = smem.k; (j < hi) && (c < max_occ); j+=step, c++)
         {
             int64_t pos = j;
+            /* Prefetch SAL_PFD iterations ahead. Both arrays sit on
+             * separate cache lines, so issue both prefetches per slot. */
+            int64_t pf_pos = pos + SAL_PFD * step;
+            if (pf_pos < hi) {
+                _mm_prefetch((const char *)(sa_ms_byte + pf_pos), _MM_HINT_T0);
+                _mm_prefetch((const char *)(sa_ls_word + pf_pos), _MM_HINT_T0);
+            }
             int64_t sa_entry = sa_ms_byte[pos];
             sa_entry = sa_entry << 32;
             sa_entry = sa_entry + sa_ls_word[pos];
-            //_mm_prefetch((const char *)(sa_ms_byte + pos + SAL_PFD * step), _MM_HINT_T0);
             coordArray[totalCoordCount + c] = sa_entry;
         }
         coordCountArray[i] = c;

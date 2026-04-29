@@ -55,7 +55,7 @@ Our shim delegates the paired-end decision to upstream's `mem_pair_resolve` (exp
 
 ### 2. `mem_opt_t` / `mem_pestat_t` layouts are mirrored in two places
 
-They're in `shim/bwa_shim_types.h` (what bindgen reads) and in upstream's `bwamem.h` (what `bwa_shim_align.cpp` includes). Both must stay byte-identical. A bindgen layout-assertion test (`bindgen_test_layout_mem_opt_t`) catches drift at build time. On `refresh-bwa-mem3.sh`, diff `vendor/bwa-mem3/src/bwamem.h` around lines 76–108 (`mem_opt_t`) and 162–166 (`mem_pestat_t`); update `shim/bwa_shim_types.h` if either changed.
+They're in `shim/bwa_shim_types.h` (what bindgen reads) and in upstream's `bwamem.h` (what `bwa_shim_align.cpp` includes). Both must stay byte-identical. A bindgen layout-assertion test (`bindgen_test_layout_mem_opt_t`) catches drift at build time. On `refresh-bwa-mem3.sh`, diff `vendor/bwa-mem3/src/bwamem.h` around lines 77–115 (`mem_opt_t`) and 172–176 (`mem_pestat_t`); update `shim/bwa_shim_types.h` if either changed.
 
 ### 3. macOS deployment target mismatch → SIGBUS at test-binary startup
 
@@ -82,6 +82,14 @@ bwa-mem3's internal `mem_aln_t.cigar` uses opcode table `MIDSH` (M=0 I=1 D=2 S=3
 - `main.cpp` — CLI entry point
 - `bwtindex.cpp` — index builder (not our concern)
 - `runsimd.cpp` — unguarded `int main()` collides with Rust test harness
+- `bam_writer.cpp`, `meth_bam.cpp` — htslib-dependent; shim emits BAM directly
+- `fm_index_writer.cpp`, `index_prelude.cpp`, `libsais_build.cpp` — index builder
+
+The htslib- and libsais-dependent TUs would also fail to link: the
+refresh script prunes `ext/htslib`, `ext/libsais`, `ext/mimalloc`, and
+`ext/doctest` from the vendor tree. If a future refresh wants to
+re-enable any of them, restore the relevant submodule first (or
+`scripts/refresh-bwa-mem3.sh`'s `DROP_SUBTREES`).
 
 `fastmap.cpp` is built (was previously excluded) so `libbwa-mem3.a` exports `worker_alloc` / `worker_free`. Its `main_mem` entry point doesn't clash with Rust's test harness.
 

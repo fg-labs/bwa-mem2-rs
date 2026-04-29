@@ -52,6 +52,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 KSEQ_DECLARE(gzFile)
 
+/* Forward-declared — keeps htslib out of this header. */
+struct bam_writer_s;
+
 typedef struct {
 	kseq_t *ks, *ks2;
 	mem_opt_t *opt;
@@ -64,7 +67,10 @@ typedef struct {
 	int64_t actual_chunk_size;
 	FILE *fp;
 	uint8_t *ref_string;
-	FMI_search *fmi;	
+	int      ref_string_is_shm;   /* 1 if ref_string aliases shm pages; do not _mm_free. */
+	FMI_search *fmi;
+	uint8_t *shm_base;            /* if non-NULL, the active /bwaidx-<base> mapping */
+	struct bam_writer_s *bam_writer;  /* non-NULL when opt->bam_mode is set */
 } ktp_aux_t;
 
 typedef struct {
@@ -81,11 +87,11 @@ int main_mem(int argc, char *argv[]);
 // Allocate all per-worker scratch buffers (chaining arrays, BSW buffers, BWT
 // scratch) on `w`, sized for `nreads` and `nthreads`. Exposed so that
 // consumers of libbwa.a that build their own worker_t (e.g. language
-// bindings) can reuse the exact same allocation layout as the bwa-mem2
+// bindings) can reuse the exact same allocation layout as the bwa-mem3
 // pipeline and stay in sync across future changes. Records `nthreads` on
 // `w.nthreads` so the matching worker_free can validate the pairing. Prints
 // a small summary to stderr. Asserts on allocation failure (matching the
-// rest of bwa-mem2).
+// rest of bwa-mem3).
 void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nthreads);
 
 // Release all per-worker scratch buffers previously allocated by

@@ -35,6 +35,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <math.h>
 #include "kstring.h"
 #include "bwamem.h"
+#include "bam_writer.h"
 #include "kvec.h"
 #include "utils.h"
 #include "ksw.h"
@@ -216,17 +217,18 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
             if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
-                b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;                                                                                                                                                                              
-                b.qe = is_rev? l_ms - aln.qb : aln.qe + 1; 
+                b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
+                b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
                 b.re = is_rev? (l_pac<<1) - (rb + aln.tb) : rb + aln.te + 1;
                 b.score = aln.score;
                 b.csub = aln.score2;
                 b.secondary = -1;
                 b.seedcov = (b.re - b.rb < b.qe - b.qb? b.re - b.rb : b.qe - b.qb) >> 1;
+                b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
 
                 kv_push(mem_alnreg_t, *ma, b); // make room for a new element
-                
+
                 #if !MATE_SORT
                 // move b s.t. ma is sorted
                 for (i = 0; i < ma->n - 1; ++i) // find the insertion point
@@ -526,7 +528,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
                uint64_t id, bseq1_t s[2], mem_alnreg_v a[2])
 {
     extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
-    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query);
+    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn);
 
     int i, j, z[2], extra_flag, n_pri[2], q_se[2], n_aa[2], paired;
     kstring_t str;
@@ -542,9 +544,10 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
 
     if (paired) {
         char **XA[2];
+        int *HN[2] = { 0, 0 };
         if (!(opt->flag & MEM_F_ALL)) {
             for (i = 0; i < 2; ++i)
-                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq);
+                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i]);
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
@@ -553,6 +556,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
 
             h[i].flag |= 0x40<<i | extra_flag;
             h[i].XA = XA[i]? XA[i][z[i]] : 0;
+            h[i].HN = HN[i]? HN[i][z[i]] : -1;
             aa[i][n_aa[i]++] = h[i];
             if (n_pri[i] < a[i].n) { // the read has ALT hits
                 mem_alnreg_t *p = &a[i].a[n_pri[i]];
@@ -560,21 +564,36 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
                 g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
+                g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
+                if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
+                    g[i].mapq = 0; // fg-labs: force repetitive-supp MAPQ to 0
                 aa[i][n_aa[i]++] = g[i];
             }
         }
         for (i = 0; i < n_aa[0]; ++i)
-            mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]); // write read1 hits
+            mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]);
 
-        assert(str.s != 0);
-        s[0].sam = strdup(str.s); str.l = 0;
-        for (i = 0; i < n_aa[1]; ++i)
-            mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]); // write read2 hits
-        s[1].sam = str.s;
+        if (opt->bam_mode) {
+            /* BAM path (meth or generic): mem_aln2sam short-circuited
+             * into s->bams, leaving str untouched. Skip the str.s dance. */
+            s[0].sam = NULL;
+            str.l = 0;
+            for (i = 0; i < n_aa[1]; ++i)
+                mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]);
+            s[1].sam = NULL;
+            free(str.s); str.s = NULL; str.m = 0;
+        } else {
+            assert(str.s != 0);
+            s[0].sam = strdup(str.s); str.l = 0;
+            for (i = 0; i < n_aa[1]; ++i)
+                mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]); // write read2 hits
+            s[1].sam = str.s;
+        }
         if (strcmp(s[0].name, s[1].name) != 0) err_fatal(__func__, "paired reads have different names: \"%s\", \"%s\"\n", s[0].name, s[1].name);
         // free
         for (i = 0; i < 2; ++i) {
             free(h[i].cigar); free(g[i].cigar);
+            free(HN[i]);
             if (XA[i] == 0) continue;
             for (j = 0; j < a[i].n; ++j) free(XA[i][j]);
             free(XA[i]);
@@ -583,20 +602,24 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
     }
 
     // no_pairing
+    int which[2] = { -1, -1 };
     for (i = 0; i < 2; ++i) {
-        int which = -1;
         if (a[i].n) {
-            if (a[i].a[0].score >= opt->T) which = 0;
+            if (a[i].a[0].score >= opt->T) which[i] = 0;
             else if (n_pri[i] < a[i].n && a[i].a[n_pri[i]].score >= opt->T)
-                which = n_pri[i];
+                which[i] = n_pri[i];
         }
-        if (which >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which]);
+        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]]);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
-    if (!(opt->flag & MEM_F_NOPAIRING) && h[0].rid == h[1].rid && h[0].rid >= 0) { // if the top hits from the two ends constitute a proper pair, flag it.
+    // Proper-pair flag must be computed from the same alignments that were just
+    // emitted via mem_reg2aln — i.e. a[i].a[which[i]]. Using a[i].a[0] here is
+    // wrong when which[i] == n_pri[i] (below-T primary + above-T ALT case).
+    if (!(opt->flag & MEM_F_NOPAIRING) && which[0] >= 0 && which[1] >= 0 &&
+        h[0].rid == h[1].rid && h[0].rid >= 0) {
         int64_t dist;
         int d;
-        d = mem_infer_dir(bns->l_pac, a[0].a[0].rb, a[1].a[0].rb, &dist);
+        d = mem_infer_dir(bns->l_pac, a[0].a[which[0]].rb, a[1].a[which[1]].rb, &dist);
         if (!pes[d].failed && dist >= pes[d].low && dist <= pes[d].high) extra_flag |= 2;
     }
     mem_reg2sam(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1]);
@@ -706,12 +729,12 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     for (int i=0; i<pcnt-pcnt8; i++)
         seqPairArray[pcnt + MAX_LINE_LEN - 1 - i] = seqPairArray[pcnt-i-1];
     
-#if __AVX512BW__    
+#if BWAMEM_BATCHED_MATESW
     pwsw->getScores8(seqPairArray, seqBufRef, seqBufQer, aln, pcnt8, nthreads, 0);
     pwsw->getScores16(seqPairArray + pcnt8 + MAX_LINE_LEN, seqBufRef, seqBufQer,
                       aln, pcnt-pcnt8, nthreads, 0);
 #else
-    fprintf(stderr, "Error: This should not have happened!! \nPlease look in to AVX512 macros\n");
+    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
     exit(EXIT_FAILURE);
 #endif
 
@@ -755,11 +778,11 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     int pcnt2 = pos;
     assert(pos8 + pos16 == pcnt2);
 
-#if __AVX512BW__
+#if BWAMEM_BATCHED_MATESW
     pwsw->getScores16(seqPairArray + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
     pwsw->getScores8(seqPairArray, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
 #else
-    fprintf(stderr, "Error: This should not have happened!! \nPlease look in to AVX512 macros\n");
+    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
     exit(EXIT_FAILURE);
 #endif
     
@@ -780,7 +803,8 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                             bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
     extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                              const mem_alnreg_v *a, int l_query, const char *query);
+                              const mem_alnreg_v *a, int l_query, const char *query,
+                              int **out_hn);
     #if MATE_SORT
     extern void sort_alnreg_re(int n, mem_alnreg_t* a);
     extern void sort_alnreg_score(int n, mem_alnreg_t* a);
@@ -919,9 +943,10 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 a[i].a[z[i]].secondary_all = -1;
             }
         }
+        int *HN[2] = { 0, 0 };
         if (!(opt->flag & MEM_F_ALL)) {
             for (i = 0; i < 2; ++i)
-                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq);
+                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i]);
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
@@ -930,6 +955,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 
             h[i].flag |= 0x40<<i | extra_flag;
             h[i].XA = XA[i]? XA[i][z[i]] : 0;
+            h[i].HN = HN[i]? HN[i][z[i]] : -1;
             aa[i][n_aa[i]++] = h[i];
             if (n_pri[i] < a[i].n) { // the read has ALT hits
                 mem_alnreg_t *p = &a[i].a[n_pri[i]];
@@ -937,20 +963,36 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
+                g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
+                if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
+                    g[i].mapq = 0; // fg-labs: force repetitive-supp MAPQ to 0
                 aa[i][n_aa[i]++] = g[i];
             }
         }
         for (i = 0; i < n_aa[0]; ++i)
-            mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]); // write read1 hits
-        assert(str.s != 0);
-        s[0].sam = strdup(str.s); str.l = 0;
-        for (i = 0; i < n_aa[1]; ++i)
-            mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]); // write read2 hits
-        s[1].sam = str.s;
+            mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]);
+
+        if (opt->bam_mode) {
+            /* BAM path (meth or generic): mem_aln2sam short-circuited
+             * into s->bams, leaving str untouched. Skip the str.s dance. */
+            s[0].sam = NULL;
+            str.l = 0;
+            for (i = 0; i < n_aa[1]; ++i)
+                mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]);
+            s[1].sam = NULL;
+            free(str.s); str.s = NULL; str.m = 0;
+        } else {
+            assert(str.s != 0);
+            s[0].sam = strdup(str.s); str.l = 0;
+            for (i = 0; i < n_aa[1]; ++i)
+                mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]);
+            s[1].sam = str.s;
+        }
         if (strcmp(s[0].name, s[1].name) != 0) err_fatal(__func__, "paired reads have different names: \"%s\", \"%s\"\n", s[0].name, s[1].name);
         // free
         for (i = 0; i < 2; ++i) {
             free(h[i].cigar); free(g[i].cigar);
+            free(HN[i]);
             if (XA[i] == 0) continue;
             for (j = 0; j < a[i].n; ++j) free(XA[i][j]);
             free(XA[i]);
@@ -959,20 +1001,24 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     return n;
 
 no_pairing:
+    int which[2] = { -1, -1 };
     for (i = 0; i < 2; ++i) {
-        int which = -1;
         if (a[i].n) {
-            if (a[i].a[0].score >= opt->T) which = 0;
+            if (a[i].a[0].score >= opt->T) which[i] = 0;
             else if (n_pri[i] < a[i].n && a[i].a[n_pri[i]].score >= opt->T)
-                which = n_pri[i];
+                which[i] = n_pri[i];
         }
-        if (which >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which]);
+        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]]);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
-    if (!(opt->flag & MEM_F_NOPAIRING) && h[0].rid == h[1].rid && h[0].rid >= 0) { // if the top hits from the two ends constitute a proper pair, flag it.
+    // Proper-pair flag must be computed from the same alignments that were just
+    // emitted via mem_reg2aln — i.e. a[i].a[which[i]]. Using a[i].a[0] here is
+    // wrong when which[i] == n_pri[i] (below-T primary + above-T ALT case).
+    if (!(opt->flag & MEM_F_NOPAIRING) && which[0] >= 0 && which[1] >= 0 &&
+        h[0].rid == h[1].rid && h[0].rid >= 0) {
         int64_t dist;
         int d;
-        d = mem_infer_dir(bns->l_pac, a[0].a[0].rb, a[1].a[0].rb, &dist);
+        d = mem_infer_dir(bns->l_pac, a[0].a[which[0]].rb, a[1].a[which[1]].rb, &dist);
         if (!pes[d].failed && dist >= pes[d].low && dist <= pes[d].high) extra_flag |= 2;
     }
     mem_reg2sam(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1]);
@@ -980,7 +1026,7 @@ no_pairing:
     if (strcmp(s[0].name, s[1].name) != 0)
         err_fatal(__func__, "paired reads have different names: \"%s\", \"%s\"\n",
                   s[0].name, s[1].name);
-    
+
     free(h[0].cigar); free(h[1].cigar);
     return n;
 }
@@ -1239,13 +1285,14 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
                 b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
-                b.qe = is_rev? l_ms - aln.qb : aln.qe + 1; 
+                b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
                 b.re = is_rev? (l_pac<<1) - (rb + aln.tb) : rb + aln.te + 1;
                 b.score = aln.score;
                 b.csub = aln.score2;
                 b.secondary = -1;
                 b.seedcov = (b.re - b.rb < b.qe - b.qb? b.re - b.rb : b.qe - b.qb) >> 1;
+                b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
 
                 kv_push(mem_alnreg_t, *ma, b); // make room for a new element
 
