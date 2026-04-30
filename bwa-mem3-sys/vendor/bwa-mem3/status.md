@@ -1,4 +1,4 @@
-# BWA-MEM2 Apple Silicon Optimization Status
+# BWA-MEM3 Apple Silicon Optimization Status
 
 ## Current State
 - Branch: `apple-silicon`
@@ -45,7 +45,7 @@
 
 ### Task 3: Native NEON for bandedSWA.cpp
 - Optimized _mm_blendv_epi16 to use native NEON vbsl (bitwise select)
-- Added _mm_movemask_epi16 and _mm_blendv_epi16_fast to simd_compat.h
+- Added `_mm_movemask_epi16` and `_mm_blendv_epi16_fast` to `simd_compat.h`
 - Modified bandedSWA.cpp to use vbsl directly on ARM instead of OR/AND/ANDNOT
 - Benchmark: 14.4s → 13.8s average (~4% improvement)
 - Correctness verified: identical AS:i scores
@@ -65,12 +65,12 @@
 ### Task 4: Multi-binary Launcher
 - On ARM/Apple Silicon, there's only one NEON instruction set level
 - Unlike x86 (SSE41/SSE42/AVX/AVX2/AVX512), no need for multiple binaries
-- arm64 Makefile target already creates symlink bwa-mem2 -> bwa-mem2.arm64
+- arm64 Makefile target already creates symlink bwa-mem3 -> bwa-mem3.arm64
 - N/A: No benefit from multi-binary approach on ARM
 
 ### Task 5: Accelerate.framework
 - Framework already linked in build for macOS
-- Analyzed compute patterns in bwa-mem2:
+- Analyzed compute patterns in bwa-mem3:
   - Smith-Waterman: Already SIMD-optimized (sse2neon)
   - FM-index: Memory-bound, pointer chasing (not vectorizable)
   - Sorting: Small arrays, not suitable for vDSP

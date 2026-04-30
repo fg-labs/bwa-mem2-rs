@@ -32,6 +32,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BWA_H_
 
 #include <stdint.h>
+#include <stdio.h>
 #include <zlib.h>
 #include "bntseq.h"
 #include "bwt.h"
@@ -59,6 +60,12 @@ typedef struct {
 typedef struct {
 	int l_seq, id;
 	char *name, *comment, *seq, *qual, *sam;
+	/* BAM output: per-read list of bam1_t* accumulated by worker threads
+	 * (used by --bam and --meth alike). Typed as void* to keep htslib out
+	 * of this header. */
+	void **bams;
+	int    n_bams;
+	int    cap_bams;
 } bseq1_t;
 
 extern int bwa_verbose;
@@ -102,8 +109,12 @@ extern "C" {
 	
 	void bwa_idx_destroy(bwaidx_t *idx);
 	void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp);
+	void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
+	                        const char *hdr_line, FILE *fp);
+	char *bwa_load_hdr_from_index(const char *prefix);
 	char *bwa_set_rg(const char *s);
 	char *bwa_insert_header(const char *s, char *hdr);
+	char *bwa_insert_header_file(FILE *fp, char *hdr);
 #ifdef __cplusplus
 }
 #endif

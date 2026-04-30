@@ -61,6 +61,11 @@ static inline void trim_readno(kstring_t *s)
 
 static inline void kseq2bseq1(const kseq_t *ks, bseq1_t *s)
 { // TODO: it would be better to allocate one chunk of memory, but probably it does not matter in practice
+    // bseq_read/bseq_read_orig grow `seqs` with realloc, which leaves the
+    // new entries uninitialized. Zero first so sam/bams/n_bams/cap_bams
+    // start well-defined — the output loop at fastmap.cpp free()s them
+    // unconditionally, so garbage from realloc would otherwise be freed.
+    memset(s, 0, sizeof(*s));
     s->name = strdup(ks->name.s);
     s->comment = ks->comment.l? strdup(ks->comment.s) : 0;
     s->seq = strdup(ks->seq.s);
@@ -443,7 +448,7 @@ void bwa_idx_destroy(bwaidx_t *idx)
     free(idx);
 }
 
-int bwa_mem2idx(int64_t l_mem, uint8_t *mem, bwaidx_t *idx)
+int bwa_mem3idx(int64_t l_mem, uint8_t *mem, bwaidx_t *idx)
 {
     int64_t k = 0, x;
     int i;
@@ -506,7 +511,7 @@ int bwa_idx2mem(bwaidx_t *idx)
     free(idx->bns); idx->bns = 0;
     free(idx->pac); idx->pac = 0;
 
-    return bwa_mem2idx(k, mem, idx);
+    return bwa_mem3idx(k, mem, idx);
 }
 #endif
 
@@ -514,48 +519,165 @@ int bwa_idx2mem(bwaidx_t *idx)
  * SAM header routines *
  ***********************/
 
-void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp)
+// Write the first line from `lines` to `fp` if print is nonzero, and return
+// a pointer to the remainder (or NULL when consumed). `lines` is newline-
+// separated but not required to be newline-terminated.
+static const char *remove_line(const char *lines, int print, FILE *fp)
 {
-    int i, n_SQ = 0;
-    extern char *bwa_pg;
-    if (hdr_line) {
-        const char *p = hdr_line;
+    const char *nl = strchr(lines, '\n');
+    if (nl) {
+        if (print) {
+            err_fwrite(lines, 1, (size_t)(nl - lines), fp);
+            err_fputc('\n', fp);
+        }
+        return nl + 1;
+    } else {
+        if (print) {
+            err_fputs(lines, fp);
+            err_fputc('\n', fp);
+        }
+        return NULL;
+    }
+}
+
+// Return 1 iff `lines` contains any @SQ header records.
+static int has_SQ(const char *lines)
+{
+    if (lines == NULL) return 0;
+    if (strncmp(lines, "@SQ\t", 4) == 0) return 1;
+    return strstr(lines, "\n@SQ\t") != NULL;
+}
+
+// Count the number of @SQ header records in `lines`.
+static int count_SQ(const char *lines)
+{
+    int n_SQ = 0;
+    if (lines) {
+        const char *p = lines;
         while ((p = strstr(p, "@SQ\t")) != 0) {
-            if (p == hdr_line || *(p-1) == '\n') ++n_SQ;
+            if (p == lines || *(p - 1) == '\n') ++n_SQ;
             p += 4;
         }
     }
-    if (n_SQ == 0) {
-        for (i = 0; i < bns->n_seqs; ++i) {
-#if ORIG
-            err_printf("@SQ\tSN:%s\tLN:%d", bns->anns[i].name, bns->anns[i].len);
-            if (bns->anns[i].is_alt) err_printf("\tAH:*\n");
-            else err_fputc('\n', stdout);
-#else
-            char buf[500];
-            sprintf(buf, "@SQ\tSN:%s\tLN:%d", bns->anns[i].name, bns->anns[i].len);
-            err_fputs(buf, fp);
-            if (bns->anns[i].is_alt) {
-                sprintf(buf, "\tAH:*\n");
-                err_fputs(buf, fp);
-            } else
-                err_fputc('\n', fp);
-#endif
-        }
-    } else if (n_SQ != bns->n_seqs && bwa_verbose >= 2)
-        fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
-               "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
-    
-#if ORIG
-    if (hdr_line) err_printf("%s\n", hdr_line);
-    if (bwa_pg) err_printf("%s\n", bwa_pg);
-#else
-    if (hdr_line) {
-        err_fputs(hdr_line, fp);
-        err_fputs("\n", fp);
+    return n_SQ;
+}
+
+// Emit the full SAM header, merging (in precedence order) user `hdr_line`
+// (from -H), `bns_hdr` (loaded from <prefix>.hdr or <baseprefix>.dict), and
+// the index's @SQ records. Precedence mirrors lh3/bwa#348:
+//   @HD : user's > index's > default "@HD\tVN:1.5\tSO:unsorted\tGO:query".
+//   @SQ : if user supplies any, use user's alone (index .hdr was already
+//         skipped by the caller); else index's @SQ; else generated from bns.
+//   Other: all remaining lines from bns_hdr, then hdr_line, then bwa_pg.
+static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
+                          const char *hdr_line, FILE *fp)
+{
+    int i, n_HD = 0, n_SQ = count_SQ(hdr_line);
+    extern char *bwa_pg;
+
+    // Emit an @HD record — prefer user's, else index's, else default — and
+    // consume any leading @HD from both streams so they are not re-emitted.
+    if (hdr_line && strncmp(hdr_line, "@HD\t", 4) == 0) {
+        hdr_line = remove_line(hdr_line, n_HD == 0, fp);
+        ++n_HD;
     }
+    if (bns_hdr && strncmp(bns_hdr, "@HD\t", 4) == 0) {
+        bns_hdr = remove_line(bns_hdr, n_HD == 0, fp);
+        ++n_HD;
+    }
+    if (n_HD == 0)
+        err_fputs("@HD\tVN:1.5\tSO:unsorted\tGO:query\n", fp);
+
+    // Generate @SQ from bns only when neither hdr_line nor bns_hdr supply any.
+    if (n_SQ == 0 && !has_SQ(bns_hdr)) {
+        for (i = 0; i < bns->n_seqs; ++i) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "@SQ\tSN:%s\tLN:%d",
+                     bns->anns[i].name, bns->anns[i].len);
+            err_fputs(buf, fp);
+            if (bns->anns[i].is_alt) err_fputs("\tAH:*\n", fp);
+            else                     err_fputc('\n', fp);
+        }
+    }
+
+    if (n_SQ != 0 && n_SQ != bns->n_seqs && bwa_verbose >= 2)
+        fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
+                "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
+
+    if (bns_hdr) { err_fputs(bns_hdr, fp); err_fputc('\n', fp); }
+    if (hdr_line) { err_fputs(hdr_line, fp); err_fputc('\n', fp); }
     if (bwa_pg) err_fputs(bwa_pg, fp);
-#endif
+}
+
+void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp)
+{
+    print_sam_hdr(bns, NULL, hdr_line, fp);
+}
+
+// Load the contents of `<prefix>.hdr` if present, else `<baseprefix>.dict`
+// (where baseprefix strips a trailing .fa/.fna/.fasta, optionally .gz), into
+// a newly-allocated, newline-separated but not newline-terminated string.
+// Returns NULL if neither file exists (or is empty). Caller owns the result
+// and must free() it.
+char *bwa_load_hdr_from_index(const char *prefix)
+{
+    if (prefix == NULL) return NULL;
+
+    kstring_t path = { 0, 0, NULL };
+    ksprintf(&path, "%s.hdr", prefix);
+    FILE *fp = fopen(path.s, "r");
+    if (!fp) {
+        // Try <baseprefix>.dict: drop the ".hdr" we just appended, then drop
+        // a trailing ".gz" (if any) and the final dotted suffix inside the
+        // basename — e.g. foo.fa -> foo, foo.fasta.gz -> foo — before
+        // appending ".dict".
+        size_t l;
+        path.l -= 4; // drop ".hdr"
+        if (path.l >= 3 && strncmp(&path.s[path.l - 3], ".gz", 3) == 0)
+            path.l -= 3;
+        for (l = path.l; l > 0 && path.s[l - 1] != '/'; --l) {
+            if (path.s[l - 1] == '.') { path.l = l - 1; break; }
+        }
+        ksprintf(&path, ".dict");
+        fp = fopen(path.s, "r");
+    }
+
+    char *out = NULL;
+    if (fp) {
+        kstring_t buf = { 0, 0, NULL };
+        int c;
+        while ((c = getc(fp)) != EOF)
+            if (c != '\r') kputc(c, &buf);
+        fclose(fp);
+
+        while (buf.l > 0 && buf.s[buf.l - 1] == '\n') --buf.l;
+        if (buf.l > 0) {
+            buf.s[buf.l] = '\0';
+            out = buf.s; // transfer ownership
+        } else {
+            free(buf.s);
+        }
+    }
+
+    free(path.s);
+    return out;
+}
+
+void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
+                        const char *hdr_line, FILE *fp)
+{
+    // If the user's -H supplies any @SQ, ignore the index .hdr/.dict content
+    // entirely — the user has taken responsibility for the @SQ block.
+    const char *bns_hdr = has_SQ(hdr_line) ? NULL : idx_hdr_lines;
+
+    if (bns_hdr) {
+        int n_SQ = count_SQ(bns_hdr);
+        if (n_SQ != 0 && n_SQ != bns->n_seqs && bwa_verbose >= 2)
+            fprintf(stderr,
+                    "[W::%s] %d @SQ lines loaded from index; %d sequences in the index. "
+                    "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
+    }
+    print_sam_hdr(bns, bns_hdr, hdr_line, fp);
 }
 
 static char *bwa_escape(char *s)
@@ -615,5 +737,62 @@ char *bwa_insert_header(const char *s, char *hdr)
         strcpy_s(hdr + len, len_s + 1, s);
     } else hdr = strdup(s);
     bwa_escape(hdr + len);
+    return hdr;
+}
+
+char *bwa_insert_header_file(FILE *fp, char *hdr)
+{
+    // Batched counterpart to bwa_insert_header: copy every @-prefixed line
+    // from fp into a single buffer, then call bwa_insert_header once on the
+    // whole thing. The per-line loop in fastmap.cpp was O(n^2) because
+    // bwa_insert_header strlen's and realloc's hdr on every call — this
+    // makes ingestion of large (~70 MB, ~1.5 M-line) headers linear.
+    //
+    // Semantics match the old loop: non-@ lines are dropped; bwa_escape is
+    // applied to the assembled string (equivalent to per-line because
+    // bwa_escape only rewrites backslash-escape pairs and copies every other
+    // byte through).
+    long file_size;
+    if (fseek(fp, 0L, SEEK_END) != 0) return hdr;
+    file_size = ftell(fp);
+    rewind(fp);
+    if (file_size <= 0) return hdr;
+
+    char *buf = (char *) calloc(1, (size_t) file_size + 1);
+    assert(buf != NULL);
+    char *p = buf;
+    // Budget for the per-call fgets: use LINE_MAX'ish 64 KiB minus 1 to
+    // match the pre-patch loop. Bound each read by the remaining buffer so
+    // a pathologically long line cannot overrun the file-sized allocation.
+    while (1) {
+        long remaining = (buf + file_size + 1) - p;
+        if (remaining <= 1) break;
+        int cap = (remaining > 0xffff) ? 0xffff : (int) remaining;
+        if (fgets(p, cap, fp) == NULL) break;
+        size_t i = strlen(p);
+        // If we hit the 64 KiB per-call budget without seeing a newline,
+        // the line is too long to fit in one fgets call. The next chunk
+        // would not start with '@' and would be silently dropped,
+        // truncating the line. Match the pre-patch assert(buf[i-1] ==
+        // '\n') behavior and fail loudly. (We only check this when cap
+        // was bounded by the 0xffff budget, not when it was bounded by
+        // the remaining buffer — the latter case is the legitimate
+        // no-trailing-newline-on-last-line scenario.)
+        if (cap >= 0xffff && i > 0 && p[i - 1] != '\n') {
+            err_fatal(__func__, "header line exceeds %d-byte read budget", cap - 1);
+        }
+        if (p[0] == '@') {
+            // bwa_insert_header strips the trailing '\n' from its input
+            // before concatenating, so preserving the newline here is what
+            // produces the between-line separator in the assembled buffer.
+            // Lines without a trailing newline (last line of a file that
+            // lacks one) are kept as-is; the final p[-1] fixup below only
+            // triggers when the final byte we wrote is '\n'.
+            p += i;
+        }
+    }
+    if (p != buf && p[-1] == '\n') p[-1] = '\0';
+    hdr = bwa_insert_header(buf, hdr);
+    free(buf);
     return hdr;
 }

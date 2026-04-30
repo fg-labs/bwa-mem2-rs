@@ -71,6 +71,7 @@ typedef struct __smem_i smem_i;
 // V17
 #define MEM_F_PRIMARY5  0x800
 #define MEM_F_KEEP_SUPP_MAPQ 0x1000
+#define MEM_F_XB        0x2000
 
 
 typedef struct mem_opt_t {
@@ -105,6 +106,12 @@ typedef struct mem_opt_t {
     int max_matesw;         // perform maximally max_matesw rounds of mate-SW for each end
     int max_XA_hits, max_XA_hits_alt; // if there are max_hits or fewer, output them all
     int8_t mat[25];         // scoring matrix; mat[0] == 0 if unset
+    int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam); meth_mode implies this
+    int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
+    int    meth_mode;       // 1 = bisulfite mode (--meth); implies bam_mode
+    char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
+    int    meth_no_chim;    // 1 to skip the longest-M <44% chimera heuristic
+    int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
 } mem_opt_t;
 
 
@@ -114,6 +121,7 @@ typedef struct abc {
     abc() {
         done = 0;
         rbeg = qbeg = len = score = aln = 0;
+        n_hits = 1;
     }
     int64_t rbeg;
     int32_t qbeg;
@@ -121,6 +129,7 @@ typedef struct abc {
     int32_t score;
     int8_t done;
     int aln;
+    int32_t n_hits;  // SMEM SA occurrence count this seed came from; 1 = unique
 } mem_seed_t; // unaligned memory
 
 typedef struct {
@@ -151,6 +160,7 @@ typedef struct mem_alnreg_t {
     int secondary;  // index of the parent hit shadowing the current hit; <0 if primary
     int secondary_all;
     int seedlen0;   // length of the starting seed
+    int chain_n_hits; // max SMEM SA-occurrence count across this chain's seeds (1 = no repetitive seed)
     int n_comp:30, is_alt:2; // number of sub-alignments chained together
     float frac_rep;
     uint64_t hash;
@@ -173,6 +183,7 @@ typedef struct { // This struct is only used for the convenience of API.
     int n_cigar;     // number of CIGAR operations
     uint32_t *cigar; // CIGAR in the BAM encoding: opLen<<4|op; op to integer mapping: MIDSH=>01234
     char *XA;        // alternative mappings
+    int HN;          // total # of hits clustered with this primary under XA_drop_ratio; -1 when not computed (e.g., MEM_F_ALL)
 
     int score, sub, alt_sc;
 } mem_aln_t;
@@ -208,6 +219,15 @@ typedef struct
     int64_t wsize_mem[MAX_THREADS];
     int64_t wsize_mem_s[MAX_THREADS];
     int64_t wsize_mem_r[MAX_THREADS];
+
+    // Lockstep SMEM batching per-slot state. One pair of contiguous SMEM
+    // buffers per thread, each of size SMEM_LOCKSTEP_N * lockstep_buf_cap[tid].
+    // Per-slot views are stride-offset into these at lockstep driver entry.
+    // Grown on demand when the batch's max_readlength exceeds the per-slot
+    // capacity.
+    SMEM    *lockstep_prev[MAX_THREADS];
+    SMEM    *lockstep_match_buf[MAX_THREADS];
+    int64_t  lockstep_buf_cap[MAX_THREADS];
 } mem_cache;
 
 // chain moved to .h
@@ -229,7 +249,7 @@ typedef struct worker_t {
     uint8_t          *ref_string;
     int16_t           nthreads;
     int32_t           nreads;
-    FMI_search       *fmi;  
+    FMI_search       *fmi;
 } worker_t;
 
 
@@ -254,7 +274,8 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 
 char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                   const mem_alnreg_v *a, int l_query, const char *query); // ONLY work after mem_mark_primary_se()
+                   const mem_alnreg_v *a, int l_query, const char *query,
+                   int **out_hn); // ONLY work after mem_mark_primary_se(); out_hn may be NULL
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq1_t *s,
                  int n, const mem_aln_t *list, int which, const mem_aln_t *m_);
 

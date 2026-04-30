@@ -30,9 +30,11 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 
 // ----------------------------------
 #include "main.h"
+#include "version.h"
+#include "bwa_shm.h"
 
-#ifndef PACKAGE_VERSION
-#define PACKAGE_VERSION "2.2.1"
+#ifdef USE_MIMALLOC
+#include <mimalloc.h>
 #endif
 
 
@@ -43,12 +45,29 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 
 int usage()
 {
-    fprintf(stderr, "Usage: bwa-mem2 <command> <arguments>\n");
+    fprintf(stderr, "Usage: bwa-mem3 <command> <arguments>\n");
     fprintf(stderr, "Commands:\n");
-    fprintf(stderr, "  index         create index\n");
-    fprintf(stderr, "  mem           alignment\n");
+    fprintf(stderr, "  index         create index (add --meth to build a bwameth-style doubled c2t reference)\n");
+    fprintf(stderr, "  mem           alignment (add --meth for bisulfite-seq: inline c2t + BAM output)\n");
+    fprintf(stderr, "  shm           load/list/drop the index in POSIX shared memory\n");
     fprintf(stderr, "  version       print version number\n");
+    fprintf(stderr, "Run `bwa-mem3 <command> --help` for command-specific options.\n");
     return 1;
+}
+
+// Append a single argv token to the @PG CL: value. Tabs inside the token
+// (common when the caller passes e.g. `-R $'@RG\tID:x\tSM:y'`) would
+// otherwise bleed into the @PG line as extra tag-separators, producing
+// SAM that strict validators reject (issue #45 / upstream bwa-mem2#293).
+// Newlines and carriage returns would be worse still: a literal \n
+// terminates the @PG record mid-line and corrupts the whole header.
+// Replace any of these with a single space; do not mutate argv itself.
+static void append_pg_cl_arg(kstring_t *pg, const char *arg)
+{
+    kputc(' ', pg);
+    for (const char *c = arg; *c != '\0'; ++c) {
+        kputc((*c == '\t' || *c == '\n' || *c == '\r') ? ' ' : *c, pg);
+    }
 }
 
 int main(int argc, char* argv[])
@@ -62,6 +81,11 @@ int main(int argc, char* argv[])
     int ret = -1;
     if (argc < 2) return usage();
 
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+        usage();
+        return 0;
+    }
+
     if (strcmp(argv[1], "index") == 0)
     {
          uint64_t tim = __rdtsc();
@@ -71,6 +95,43 @@ int main(int argc, char* argv[])
     }
     else if (strcmp(argv[1], "mem") == 0)
     {
+        // Short-circuit `mem --help` so we skip the AVX/SA banner and the
+        // post-run profiling trailer (printed below when ret==0). Skip
+        // tokens that are the value of an option that takes an argument
+        // -- otherwise `mem -R --help ...`, `mem -o --help ...`, or
+        // `mem --set-as-failed --help ...` would treat the option's
+        // value as a help request and suppress the banner. Keep the
+        // short-option string and long-option list in sync with the
+        // optstring and long_opts table in fastmap.cpp::main_mem.
+        static const char *const MEM_SHORT_OPTS_WITH_ARG =
+            "kcvsrtRABOEUwLdTQDmINWxGhyKXHofz";
+        static const char *const MEM_LONG_OPTS_WITH_ARG[] = {
+            "--set-as-failed", "--supp-rep-hard-cap", NULL,
+        };
+        for (int i = 2; i < argc; ++i) {
+            const char *t = argv[i];
+            if (strcmp(t, "--") == 0) break;
+            if (strcmp(t, "--help") == 0) return main_mem(argc-1, argv+1);
+            // Long option (no `=`): next argv token is its value.
+            int matched_long = 0;
+            for (int j = 0; MEM_LONG_OPTS_WITH_ARG[j]; ++j) {
+                if (strcmp(t, MEM_LONG_OPTS_WITH_ARG[j]) == 0) {
+                    matched_long = 1; break;
+                }
+            }
+            if (matched_long) { ++i; continue; }
+            // Short-option bundle `-abc[value]`: walk chars; the first
+            // arg-taking option consumes the rest of the bundle (if any)
+            // or the next argv token (if the bundle ends at it).
+            if (t[0] != '-' || t[1] == '\0' || t[1] == '-') continue;
+            for (const char *p = t + 1; *p; ++p) {
+                if (strchr(MEM_SHORT_OPTS_WITH_ARG, *p)) {
+                    if (*(p + 1) == '\0') ++i;
+                    break;
+                }
+            }
+        }
+
         tprof[MEM][0] = __rdtsc();
         kstring_t pg = {0,0,0};
         extern char *bwa_pg;
@@ -93,9 +154,9 @@ int main(int argc, char* argv[])
         fprintf(stderr, "* SA compression enabled with xfactor: %d\n", 0x1 << SA_COMPX);
         #endif
         
-        ksprintf(&pg, "@PG\tID:bwa-mem2\tPN:bwa-mem2\tVN:%s\tCL:%s", PACKAGE_VERSION, argv[0]);
+        ksprintf(&pg, "@PG\tID:bwa-mem3\tPN:bwa-mem3\tVN:%s\tCL:%s", PACKAGE_VERSION, argv[0]);
 
-        for (int i = 1; i < argc; ++i) ksprintf(&pg, " %s", argv[i]);
+        for (int i = 1; i < argc; ++i) append_pg_cl_arg(&pg, argv[i]);
         ksprintf(&pg, "\n");
         bwa_pg = pg.s;
         ret = main_mem(argc-1, argv+1);
@@ -107,8 +168,19 @@ int main(int argc, char* argv[])
     else if (strcmp(argv[1], "version") == 0)
     {
         puts(PACKAGE_VERSION);
+#ifdef USE_MIMALLOC
+        {
+            int mv = mi_version();
+            fprintf(stderr, "mimalloc %d.%d.%d\n", mv / 10000, (mv / 100) % 100, mv % 100);
+        }
+#endif
         return 0;
-    } else {
+    }
+    else if (strcmp(argv[1], "shm") == 0)
+    {
+        return main_shm(argc - 1, argv + 1);
+    }
+    else {
         fprintf(stderr, "ERROR: unknown command '%s'\n", argv[1]);
         return 1;
     }

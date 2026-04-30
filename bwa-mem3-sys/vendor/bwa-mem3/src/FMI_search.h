@@ -90,16 +90,58 @@ typedef struct smem_struct
 
 #define SAL_PFD 16
 
+#ifndef SMEM_LOCKSTEP_N
+#define SMEM_LOCKSTEP_N 8
+#endif
+
 class FMI_search: public indexEle
 {
     public:
     FMI_search(const char *fname);
     ~FMI_search();
     //int64_t beCalls;
-    
+
+    /* Read-only size accessors. Used by load_index_from_shm for section
+     * validation, and by the round-trip test for byte-equality checks. */
+    int64_t cp_occ_size_bytes()      const;
+    int64_t sa_sample_count()        const;
+    int64_t sa_ms_byte_size_bytes()  const { return sa_sample_count() * (int64_t)sizeof(int8_t); }
+    int64_t sa_ls_word_size_bytes() const { return sa_sample_count() * (int64_t)sizeof(uint32_t); }
+
+    /* Read-only data accessors. Used by the round-trip test to byte-compare
+     * the packed segment payload against the in-memory loader's buffers. */
+    const void     *cp_occ_data()     const { return cp_occ; }
+    const int8_t   *sa_ms_byte_data() const { return sa_ms_byte; }
+    const uint32_t *sa_ls_word_data() const { return sa_ls_word; }
+    const int64_t  *count_data()      const { return count; }
+
+    /* Return the shm segment base if load_index attached from shm, else NULL.
+     * fastmap reuses this so it doesn't have to re-attach for the ref string. */
+    uint8_t *shm_attached_base()     const { return shm_base; }
+
     int build_index();
     void load_index();
 
+    /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
+     * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
+     * destructor munmaps `base` and leaves the aliased buffers untouched. */
+    void load_index_from_shm(uint8_t *base, size_t len);
+
+    /* matchArray sizing contract (applies to all four SMEM-emitting methods
+     * below). The previous internal `max_smem` capacity guard was removed;
+     * the caller MUST pre-size matchArray to hold at least:
+     *
+     *   - getSMEMsOnePosOneThread, getSMEMsOnePosOneThread_lockstep,
+     *     getSMEMsAllPosOneThread:   numReads * max_readlength SMEMs,
+     *     where max_readlength is the function parameter passed in.
+     *
+     *   - bwtSeedStrategyAllPosOneThread:   numReads * max_seq_length SMEMs,
+     *     where max_seq_length = max_i(seq_[i].l_seq), computed by the
+     *     caller (this method takes no max_readlength parameter).
+     *
+     * Writing past the pre-sized capacity is undefined behavior. The actual
+     * number of SMEMs written is reported via *__numTotalSmem (or the
+     * int64_t return value on bwtSeedStrategyAllPosOneThread). */
     void getSMEMs(uint8_t *enc_qdb,
                   int32_t numReads,
                   int32_t batch_size,
@@ -108,7 +150,8 @@ class FMI_search: public indexEle
                   int32_t numthreads,
                   SMEM *matchArray,
                   int64_t *numTotalSmem);
-    
+
+    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                                  int16_t *query_pos_array,
                                  int32_t *min_intv_array,
@@ -121,7 +164,29 @@ class FMI_search: public indexEle
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
                                  int64_t *__numTotalSmem);
-    
+
+    /* Lockstep-batched variant of getSMEMsOnePosOneThread: advances
+     * SMEM_LOCKSTEP_N reads' SMEM walks in slot-interleaved order to expose
+     * N independent backwardExt dependency chains to the CPU's out-of-order
+     * engine. Per-read algorithm is byte-identical to the scalar path; only
+     * the cross-read interleaving is new. Output in matchArray is written
+     * in the same (read, smem) order as the scalar path via per-slot match
+     * buffers flushed by input-index cursor.
+     * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
+    void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
+                                          int16_t *query_pos_array,
+                                          int32_t *min_intv_array,
+                                          int32_t *rid_array,
+                                          int32_t numReads,
+                                          int32_t batch_size,
+                                          const bseq1_t *seq_,
+                                          int32_t *query_cum_len_ar,
+                                          int32_t  max_readlength,
+                                          int32_t minSeedLen,
+                                          SMEM *matchArray,
+                                          int64_t *__numTotalSmem);
+
+    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                  int32_t *min_intv_array,
                                  int32_t *rid_array,
@@ -133,8 +198,10 @@ class FMI_search: public indexEle
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
                                  int64_t *__numTotalSmem);
-        
-    
+
+
+    /* matchArray must hold at least numReads * (longest l_seq in seq_) SMEMs;
+     * returns the actual count written. */
     int64_t bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
                                            int32_t *max_intv_array,
                                            int32_t numReads,
@@ -174,7 +241,6 @@ class FMI_search: public indexEle
     int64_t sentinel_index;
 private:
         char file_name[PATH_MAX];
-        int64_t index_alloc;
         int64_t count[5];
         uint32_t *sa_ls_word;
         int8_t *sa_ms_byte;
@@ -182,15 +248,35 @@ private:
 
         uint64_t *one_hot_mask_array;
 
-        int64_t pac_seq_len(const char *fn_pac);
-        void pac2nt(const char *fn_pac,
-                    std::string &reference_seq);
-        int build_fm_index(const char *ref_file_name,
-                               char *binary_seq,
-                               int64_t ref_seq_len,
-                               int64_t *sa_bwt,
-                               int64_t *count);
+        /* If non-NULL, cp_occ / sa_ms_byte / sa_ls_word point into a shared
+         * memory mapping owned by the shm segment rather than being
+         * _mm_malloc'd. shm_len is the byte length of the mapping so the
+         * destructor can munmap it; the destructor also skips _mm_free on
+         * shm-backed buffers. */
+        uint8_t *shm_base;
+        size_t   shm_len;
+
         SMEM backwardExt(SMEM smem, uint8_t a);
+
+    // ----- Lockstep SMEM batching internals -----
+    // Defined in FMI_search.cpp. Phases and per-slot state are scoped to
+    // the lockstep driver; not used anywhere else.
+    struct BatchSlot;
+
+    void ls_init_slot(BatchSlot *s, int32_t input_idx,
+                      const int16_t *query_pos_array,
+                      const int32_t *min_intv_array,
+                      const int32_t *rid_array,
+                      const bseq1_t *seq_,
+                      const int32_t *query_cum_len_ar,
+                      const uint8_t *enc_qdb);
+    void ls_prefetch_cp_occ(const BatchSlot *s);
+    void ls_prefetch_cp_occ_t1(const BatchSlot *s);
+    void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb);
+    void ls_prepare_backward(BatchSlot *s);
+    void ls_advance_backward_step(BatchSlot *s,
+                                  const uint8_t *enc_qdb,
+                                  int32_t minSeedLen);
 };
 
 #endif

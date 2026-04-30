@@ -373,8 +373,32 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     uint8x16_t oe_ins_vec = vdupq_n_u8(this->o_ins + this->e_ins);
     uint8x16_t five_vec = vdupq_n_u8(DUMMY5);
     uint8x16_t gmax_vec = zero_vec;
-    int16x8_t te_vec = vdupq_n_s16(-1);
+    // 8-bit SW processes 16 pairs per SIMD batch, but te must be tracked in
+    // 16-bit precision (ref positions > 255 are possible). Use two
+    // int16x8 vectors — _lo for pairs 0-7, _hi for pairs 8-15 — so every
+    // pair has its own te slot. The earlier single int16x8 te_vec plus
+    // hacky "duplicate on store" only tracked pairs 0-7 correctly; pairs
+    // 8-15 got copies of the wrong pair's te.
+    int16x8_t te_vec_lo = vdupq_n_s16(-1);
+    int16x8_t te_vec_hi = vdupq_n_s16(-1);
     uint8x16_t cmax_vec = vdupq_n_u8(255);
+    // "Frozen" mask: tracks which pairs have hit their KSW_XSTOP target
+    // in a prior row. Once frozen, a pair's gmax/te/qe must not be updated
+    // — otherwise later rows (which may contain untouched ref bytes when
+    // the caller only partially reversed the buffer) can add spurious
+    // matches, pushing phase-1's score above phase-0's and breaking the
+    // write-back gate `aln[ind].score == score[l]` at line ~538.
+    uint8x16_t frozen_vec = zero_vec;
+
+    /* Per-lane mask of "this lane has a real KSW_XSTOP target set" (derived
+     * from endsc_msk_a). endsc[i] defaults to 0 for lanes without a target,
+     * which would otherwise make vcgeq_u8(gmax, endsc_vec) trivially true
+     * and cause premature freezing. */
+    uint8_t _has_endsc_bytes[SIMD_WIDTH8];
+    for (int _i = 0; _i < SIMD_WIDTH8; _i++) {
+        _has_endsc_bytes[_i] = (endsc_msk_a & (1 << _i)) ? 0xFF : 0x00;
+    }
+    uint8x16_t has_endsc_vec = vld1q_u8(_has_endsc_bytes);
 
     uint16_t exit0 = 0xFFFF;
 
@@ -487,15 +511,51 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
         uint8x16_t cmp0 = vcgtq_u8(imax_vec, gmax_vec);
         uint16_t cmp0_msk = neon_movemask_u8(cmp0);
         cmp0_msk &= exit0;
-        gmax_vec = vmaxq_u8(gmax_vec, imax_vec);
-        /* Update te for elements where imax > gmax */
-        te_vec = vbslq_s16(vreinterpretq_u16_u8(cmp0), i_vec, te_vec);
-        qe_vec = vbslq_u8(cmp0, iqe_vec, qe_vec);
+
+        /* 16-bit-wide comparison mirrors cmp0 but with 0xFFFF/0x0000 per
+         * 16-bit lane, suitable for updating the two halves of te. Must be
+         * computed BEFORE the vmaxq_u8 update of gmax_vec (same as cmp0). */
+        uint16x8_t cmp_lo_16 = vcgtq_u16(vmovl_u8(vget_low_u8(imax_vec)),
+                                         vmovl_u8(vget_low_u8(gmax_vec)));
+        uint16x8_t cmp_hi_16 = vcgtq_u16(vmovl_u8(vget_high_u8(imax_vec)),
+                                         vmovl_u8(vget_high_u8(gmax_vec)));
+
+        /* 16-bit frozen masks (0xFFFF per lane where frozen, else 0x0000).
+         * Widen 0xFF/0x00 bytes: vtstq_u8-style check, but we can use
+         * vmovl_u8 + vcgtq to turn non-zero into 0xFFFF. */
+        uint16x8_t frozen_lo_16 = vcgtq_u16(
+            vmovl_u8(vget_low_u8(frozen_vec)), vdupq_n_u16(0));
+        uint16x8_t frozen_hi_16 = vcgtq_u16(
+            vmovl_u8(vget_high_u8(frozen_vec)), vdupq_n_u16(0));
+
+        /* Combine "imax > gmax" with "not frozen" for the final update masks */
+        cmp_lo_16 = vbicq_u16(cmp_lo_16, frozen_lo_16);
+        cmp_hi_16 = vbicq_u16(cmp_hi_16, frozen_hi_16);
+        uint8x16_t cmp0_active = vbicq_u8(cmp0, frozen_vec);
+
+        /* gmax: pick new max for active lanes, keep frozen lanes' stored
+         * value. This is what prevents later rows from inflating a lane's
+         * score beyond its phase-0 target once it's already "done". */
+        uint8x16_t new_gmax = vmaxq_u8(gmax_vec, imax_vec);
+        gmax_vec = vbslq_u8(frozen_vec, gmax_vec, new_gmax);
+
+        /* Update te/qe only for active lanes (imax > gmax AND not frozen) */
+        te_vec_lo = vbslq_s16(cmp_lo_16, i_vec, te_vec_lo);
+        te_vec_hi = vbslq_s16(cmp_hi_16, i_vec, te_vec_hi);
+        qe_vec = vbslq_u8(cmp0_active, iqe_vec, qe_vec);
 
         /* Check end score threshold */
         uint8x16_t cmp_end = vcgeq_u8(gmax_vec, endsc_vec);
         uint16_t cmp_end_msk = neon_movemask_u8(cmp_end);
         cmp_end_msk &= endsc_msk_a;
+
+        /* Freeze any lane that just hit its KSW_XSTOP target. From the
+         * next row onwards, frozen lanes will skip the gmax/te/qe updates
+         * above. has_endsc_vec ensures we only freeze lanes that actually
+         * set a target (endsc_vec defaults to 0 otherwise, which would
+         * match cmp_end trivially). */
+        uint8x16_t just_hit = vandq_u8(cmp_end, has_endsc_vec);
+        frozen_vec = vorrq_u8(frozen_vec, just_hit);
 
         /* Check for overflow */
         uint8x16_t left_vec = vqaddq_u8(gmax_vec, sft_vec);
@@ -512,8 +572,12 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
         uint8_t *S = H1; H1 = H0; H0 = S;
     }
 
-    /* Store final row max */
-    vst1q_u8(rowMax + (i - 1) * SIMD_WIDTH8, pimax_vec);
+    /* Store final row max. Guard on i > 0: when every pair in the batch
+     * has len1 == 0, nrow == 0, the DP loop never runs, and `i - 1`
+     * underflows into the allocation prefix. Upstream PR 289 / issue 38. */
+    if (i > 0) {
+        vst1q_u8(rowMax + (i - 1) * SIMD_WIDTH8, pimax_vec);
+    }
 
     /* Extract results */
     uint8_t score[SIMD_WIDTH8] __attribute((aligned(128)));
@@ -521,8 +585,8 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     uint8_t qe[SIMD_WIDTH8] __attribute((aligned(128)));
 
     vst1q_u8(score, gmax_vec);
-    vst1q_s16(te1, te_vec);
-    vst1q_s16(te1 + 8, te_vec);  // duplicate for 16-element access
+    vst1q_s16(te1, te_vec_lo);       // pairs 0-7
+    vst1q_s16(te1 + 8, te_vec_hi);   // pairs 8-15
     vst1q_u8(qe, qe_vec);
 
     int live = 0;
@@ -564,61 +628,89 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
 
     if (live == 0) return 1;
 
-    /* Score2 and te2 computation */
+    /* Score2 and te2 computation.
+     *
+     * Per-lane scalar emulation of ksw_u8's b[] build + score2 scan
+     * (src/ksw.cpp:201). scalar ksw_u8 collapses consecutive rows >=
+     * minsc into a single b[] entry anchored at the max-score row; a
+     * plateau straddling the primary region [te - val, te + val] is
+     * excluded entirely when its anchor lies inside. A dense SIMD scan
+     * treats every row independently and pulls out-of-region rows of a
+     * boundary-straddling plateau in as false suboptimals, inflating `sub`.
+     * Emulate scalar exactly, per lane, on the precomputed
+     * rowMax. Cost is O(SIMD_WIDTH8 * limit) scalar ops per batch,
+     * negligible next to the SIMD DP that built rowMax. */
     int qmax = this->g_qmax;
-    int16_t low[SIMD_WIDTH8] __attribute((aligned(128)));
-    int16_t high[SIMD_WIDTH8] __attribute((aligned(128)));
-    int maxl = 0, minh = nrow;
-
-    for (int i = 0; i < SIMD_WIDTH8; i++)
-    {
-        int val = (score[i] + qmax - 1) / qmax;
-        int16_t *te = te1;
-        low[i] = te[i] - val;
-        high[i] = te[i] + val;
-        if (qe[i]) {
-            maxl = maxl < low[i] ? low[i] : maxl;
-            minh = minh > high[i] ? high[i] : minh;
-        }
+    int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
+    int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
+    for (int j = 0; j < SIMD_WIDTH8; j++) {
+        int val = (score[j] + qmax - 1) / qmax;
+        low[j]  = te1[j] - val;
+        high[j] = te1[j] + val;
     }
 
-    uint8x16_t max2_vec = zero_vec;
-    int16x8_t te2_vec = vdupq_n_s16(-1);
+    /* rowMax entries produced: i == limit on normal completion, and
+     * i == limit + 1 after early exit (limit = i++ stores old i). Using i
+     * directly gives a single expression that covers both exit paths and
+     * includes the terminating row stored at rowMax[limit]. */
+    const int processed_rows = i;
 
-    /* Find second best score outside primary alignment region */
-    for (int i = 0; i < maxl; i++)
-    {
-        uint8x16_t rmax_vec = vld1q_u8(rowMax + i * SIMD_WIDTH8);
-        uint8x16_t cmp = vcgtq_u8(rmax_vec, max2_vec);
-        max2_vec = vmaxq_u8(max2_vec, rmax_vec);
-    }
-
-    for (int i = minh + 1; i < limit; i++)
-    {
-        uint8x16_t rmax_vec = vld1q_u8(rowMax + i * SIMD_WIDTH8);
-        uint8x16_t cmp = vcgtq_u8(rmax_vec, max2_vec);
-        max2_vec = vmaxq_u8(max2_vec, rmax_vec);
-    }
-
-    uint8_t temp2[SIMD_WIDTH8] __attribute((aligned(128)));
-    int16_t temp4[SIMD_WIDTH8] __attribute((aligned(128)));
-    vst1q_u8(temp2, max2_vec);
-    vst1q_s16(temp4, te2_vec);
-    vst1q_s16(temp4 + 8, te2_vec);
-
-    for (int i = 0; i < SIMD_WIDTH8 && (po_ind + i) < numPairs; i++)
-    {
-        int ind = po_ind + i;
-#if !MAINY
-        ind = p[i].regid;
-#endif
-        if (qe[i]) {
-            aln[ind].score2 = (temp2[i] == 0 ? (int)-1 : (uint8_t)temp2[i]);
-            aln[ind].te2 = temp4[i];
-        } else {
+    for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
+        int ind = p[l].regid;
+        /* Match scalar ksw_u8: when KSW_XSUBO is absent, minsc = 0x10000
+         * so the b[] list never starts and score2/te2 stay at -1.
+         * minsc_msk_a tracks lanes with KSW_XSUBO set; lanes not in the
+         * mask have minsc[l] zero-initialized and must skip the scan. */
+        if (!qe[l] || !(minsc_msk_a & (1u << l))) {
             aln[ind].score2 = -1;
-            aln[ind].te2 = -1;
+            aln[ind].te2    = -1;
+            continue;
         }
+
+        int len1_l  = (int)p[l].len1;
+        int low_l   = (int)low[l];
+        int high_l  = (int)high[l];
+        int minsc_l = (int)minsc[l];
+        int score2  = -1;
+        int te2     = -1;
+        /* b_pos = -2 sentinel: (-2 + 1) != any real row, forces an
+         * "append" on the first qualifying row. */
+        int b_score = -1;
+        int b_pos   = -2;
+
+        int nrows = processed_rows < len1_l ? processed_rows : len1_l;
+        for (int i2 = 0; i2 < nrows; i2++) {
+            int imax = (int)rowMax[i2 * SIMD_WIDTH8 + l];
+            if (imax < minsc_l) continue;
+
+            if (b_pos + 1 != i2) {
+                /* APPEND: flush the outgoing b[] entry to score2 first. */
+                if (b_pos >= 0 &&
+                    (b_pos < low_l || b_pos > high_l) &&
+                    b_score > score2) {
+                    score2 = b_score;
+                    te2    = b_pos;
+                }
+                b_score = imax;
+                b_pos   = i2;
+            } else if (b_score < imax) {
+                /* UPDATE: strict greater extends the run's anchor. Equal
+                 * imax leaves b_pos in place (matches scalar). */
+                b_score = imax;
+                b_pos   = i2;
+            }
+        }
+
+        /* Flush trailing b[] entry. */
+        if (b_pos >= 0 &&
+            (b_pos < low_l || b_pos > high_l) &&
+            b_score > score2) {
+            score2 = b_score;
+            te2    = b_pos;
+        }
+
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
 
     return 1;
@@ -763,104 +855,142 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
                        int32_t numPairs,
                        int phase)
 {
-    int m_b, n_b;
-    int16_t minsc[SIMD_WIDTH16] = {0}, endsc[SIMD_WIDTH16] = {0};
-    uint64_t *b;
-    int limit = nrow;
+    /* NEON 16-bit mate-rescue kernel.
+     *
+     * Structural port of kswv_neon_u8: real rowMax writes each row,
+     * per-lane freeze once a lane hits its KSW_XSTOP target (gated by
+     * has_endsc_vec so lanes without a target aren't frozen prematurely),
+     * per-row frozen_bits collapsed from frozen_vec for the batched early
+     * exit, and a scalar b[]-emulation score2 scan over rowMax matching
+     * scalar ksw_i16 exactly. The
+     * pre-rewrite kernel never wrote rowMax, never computed score2
+     * (hardcoded to -1), and global-broke the DP as soon as any lane's
+     * gmax >= endsc_vec (trivially true for mate-rescue pairs whose
+     * endsc_vec defaults to 0 since KSW_XSTOP is unset) — which made
+     * `score`/`te`/`qe` almost garbage too. Replaced with proper SIMD
+     * semantics matching the 8-bit NEON kernel.
+     *
+     * 16-bit specifics vs 8-bit:
+     *   - 8 lanes (SIMD_WIDTH16), single te_vec (no _lo/_hi split)
+     *   - int16 arithmetic; no shift offset, clamp intermediate H to 0
+     *     via vmaxq_s16 (scalar ksw_i16 does the same)
+     *   - No u8 overflow check; int16 has plenty of headroom for SW scores
+     */
+    int16_t minsc[SIMD_WIDTH16] __attribute((aligned(128))) = {0};
+    int16_t endsc[SIMD_WIDTH16] __attribute((aligned(128))) = {0};
 
     int16x8_t zero_vec = vdupq_n_s16(0);
-    int16x8_t one_vec = vdupq_n_s16(1);
+    int16x8_t one_vec  = vdupq_n_s16(1);
 
-    int16_t temp[SIMD_WIDTH16] __attribute((aligned(128))) = {0};
+    /* Scoring table: 32-byte int8 table indexed by (s1 ^ s2) in [0..31].
+     *
+     * IMPORTANT: The table must be byte-wide (not int16-wide) AND must
+     * cover all 32 possible xor values. The pre-rewrite kernel used an
+     * 8-entry int16 table (16 bytes) and did `vqtbl1q_s8(perm, xor_val)`
+     * + reinterpret to int16 — treating each int16 xor value's low+high
+     * bytes as two byte indices, producing sbt[i] = (w_match << 8) |
+     * perm[xor_low], inflating match scores by 256. That bug was latent
+     * while smoke-1M never exercised the 16-bit path (l_ms*opt->a < 250
+     * routes to 8-bit), but `-A 2` makes l_ms*2 = 300 >= 250 and
+     * surfaces it.
+     *
+     * The 16-bit kernel's SoA uses wider ambig / tail-padding constants
+     * than 8-bit (AMBR16=15, AMBQ16=16, DUMMY3=26 vs AMBR=4, AMBQ=8,
+     * DUMMY5=5), so xor values can reach 31. A 32-byte table built via
+     * vqtbl2_s8 handles all of them:
+     *   [0]     -> w_match       (base == base; also AMBR^AMBR, AMBQ^AMBQ,
+     *                             but those pairings don't occur)
+     *   [1..3]  -> w_mismatch    (base != base)
+     *   [21,24..27] -> 0         (anything ^ DUMMY3 = query tail padding,
+     *                             must contribute 0 like scalar would)
+     *   other   -> w_ambig       (any xor involving AMBR16 or AMBQ16)
+     * Boundary (high bit of s1|s2) is handled separately by zeroing m11. */
+    int8_t temp8[32] __attribute((aligned(16)));
+    for (int i = 0; i < 32; i++) temp8[i] = this->w_ambig;
+    temp8[0] = this->w_match;
+    temp8[1] = temp8[2] = temp8[3] = this->w_mismatch;
+    /* Query-tail DUMMY3 (=26): s1 ∈ {0..3, 15} xor 26 = {21, 24..27}.
+     * Those indices must contribute 0 to match scalar's tail semantics. */
+    temp8[21] = 0;
+    temp8[24] = temp8[25] = temp8[26] = temp8[27] = 0;
+    int8x16x2_t perm_vec;
+    perm_vec.val[0] = vld1q_s8(temp8);
+    perm_vec.val[1] = vld1q_s8(temp8 + 16);
 
-    /* Build scoring table for 16-bit */
-    temp[0] = this->w_match;
-    temp[1] = temp[2] = temp[3] = this->w_mismatch;
-    for (int i = 4; i < 8; i++) temp[i] = this->w_ambig;
-
-    int16x8_t perm_vec = vld1q_s16(temp);
-
-    m_b = n_b = 0; b = 0;
-
+    /* Per-lane minsc / endsc + msk bitmasks. Same convention as the 8-bit
+     * kernel: minsc_msk_a bit set iff lane has a real KSW_XSUBO target that
+     * fits in s16; same for endsc_msk_a / KSW_XSTOP. */
     uint8_t minsc_msk_a = 0x00, endsc_msk_a = 0x00;
-    int val = 0;
     for (int i = 0; i < SIMD_WIDTH16; i++) {
         int xtra = p[i].h0;
-        val = (xtra & KSW_XSUBO) ? xtra & 0xffff : 0x10000;
-        if (val <= SHRT_MAX) {
-            minsc[i] = val;
-            minsc_msk_a |= (0x1 << i);
-        }
+        int val = (xtra & KSW_XSUBO) ? xtra & 0xffff : 0x10000;
+        if (val <= SHRT_MAX) { minsc[i] = (int16_t)val; minsc_msk_a |= (0x1 << i); }
         val = (xtra & KSW_XSTOP) ? xtra & 0xffff : 0x10000;
-        if (val <= SHRT_MAX) {
-            endsc[i] = val;
-            endsc_msk_a |= (0x1 << i);
-        }
+        if (val <= SHRT_MAX) { endsc[i] = (int16_t)val; endsc_msk_a |= (0x1 << i); }
     }
 
     int16x8_t minsc_vec = vld1q_s16(minsc);
     int16x8_t endsc_vec = vld1q_s16(endsc);
 
-    int16x8_t e_del_vec = vdupq_n_s16(this->e_del);
+    int16x8_t e_del_vec  = vdupq_n_s16(this->e_del);
     int16x8_t oe_del_vec = vdupq_n_s16(this->o_del + this->e_del);
-    int16x8_t e_ins_vec = vdupq_n_s16(this->e_ins);
+    int16x8_t e_ins_vec  = vdupq_n_s16(this->e_ins);
     int16x8_t oe_ins_vec = vdupq_n_s16(this->o_ins + this->e_ins);
-    int16x8_t gmax_vec = zero_vec;
-    int16x8_t te_vec = vdupq_n_s16(-1);
 
-    uint8_t exit0 = 0xFF;
+    int16x8_t gmax_vec = zero_vec;
+    int16x8_t te_vec   = vdupq_n_s16(-1);
+    int16x8_t qe_vec   = zero_vec;
+
+    /* Per-lane freeze once a pair hits its KSW_XSTOP target. Gated by
+     * has_endsc_vec so lanes with endsc[i] == 0 (no XSTOP) never freeze. */
+    int16x8_t frozen_vec = zero_vec;
+    int16_t _has_endsc_arr[SIMD_WIDTH16] __attribute((aligned(128)));
+    for (int i = 0; i < SIMD_WIDTH16; i++)
+        _has_endsc_arr[i] = (endsc_msk_a & (1 << i)) ? (int16_t)0xFFFF : (int16_t)0x0000;
+    int16x8_t has_endsc_vec = vld1q_s16(_has_endsc_arr);
 
     tid = 0;
-    int16_t *H0 = H16_0 + tid * SIMD_WIDTH16 * this->maxQerLen;
-    int16_t *H1 = H16_1 + tid * SIMD_WIDTH16 * this->maxQerLen;
-    int16_t *Hmax = H16_max + tid * SIMD_WIDTH16 * this->maxQerLen;
-    int16_t *F = F16 + tid * SIMD_WIDTH16 * this->maxQerLen;
+    int16_t *H0     = H16_0    + tid * SIMD_WIDTH16 * this->maxQerLen;
+    int16_t *H1     = H16_1    + tid * SIMD_WIDTH16 * this->maxQerLen;
+    int16_t *Hmax   = H16_max  + tid * SIMD_WIDTH16 * this->maxQerLen;
+    int16_t *F      = F16      + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *rowMax = rowMax16 + tid * SIMD_WIDTH16 * this->maxRefLen;
 
-    for (int i = 0; i <= ncol; i++)
-    {
-        vst1q_s16(H0 + i * SIMD_WIDTH16, zero_vec);
+    for (int i = 0; i <= ncol; i++) {
+        vst1q_s16(H0   + i * SIMD_WIDTH16, zero_vec);
         vst1q_s16(Hmax + i * SIMD_WIDTH16, zero_vec);
-        vst1q_s16(F + i * SIMD_WIDTH16, zero_vec);
+        vst1q_s16(F    + i * SIMD_WIDTH16, zero_vec);
     }
-
-    int16x8_t max_vec = zero_vec, imax_vec, pimax_vec = zero_vec;
-    int16x8_t qe_vec = vdupq_n_s16(0);
     vst1q_s16(H0, zero_vec);
     vst1q_s16(H1, zero_vec);
 
-    int i;
-    for (i = 0; i < nrow; i++)
-    {
-        int16x8_t e11 = zero_vec;
-        int16x8_t h00, h11, h10, s1;
-        int16x8_t i_vec = vdupq_n_s16(i);
-        int j;
+    int16x8_t imax_vec, pimax_vec = zero_vec;
 
-        s1 = vld1q_s16(seq1SoA + (i + 0) * SIMD_WIDTH16);
-        h10 = zero_vec;
+    int i, limit = nrow;
+    for (i = 0; i < nrow; i++) {
+        int16x8_t e11 = zero_vec;
+        int16x8_t s1  = vld1q_s16(seq1SoA + i * SIMD_WIDTH16);
         imax_vec = zero_vec;
         int16x8_t iqe_vec = vdupq_n_s16(-1);
+        int16x8_t l_vec   = zero_vec;
+        int16x8_t i_vec   = vdupq_n_s16((int16_t)i);
 
-        int16x8_t l_vec = zero_vec;
-        for (j = 0; j < ncol; j++)
-        {
-            int16x8_t f11, s2, f21;
-            h00 = vld1q_s16(H0 + j * SIMD_WIDTH16);
-            s2 = vld1q_s16(seq2SoA + j * SIMD_WIDTH16);
-            f11 = vld1q_s16(F + (j + 1) * SIMD_WIDTH16);
+        for (int j = 0; j < ncol; j++) {
+            int16x8_t h00 = vld1q_s16(H0 + j * SIMD_WIDTH16);
+            int16x8_t s2  = vld1q_s16(seq2SoA + j * SIMD_WIDTH16);
+            int16x8_t f11 = vld1q_s16(F + (j + 1) * SIMD_WIDTH16);
 
-            /* Core computation */
             int16x8_t xor_val = veorq_s16(s1, s2);
-            /* Table lookup with limited index range. vqtbl1q_s8 returns
-             * int8x16_t; reinterpret to int16x8_t so downstream arithmetic
-             * on `sbt` (vaddq_s16, etc.) types correctly. Apple's clang
-             * accepts the implicit conversion; gcc aarch64 does not. */
-            int16x8_t sbt = vreinterpretq_s16_s8(
-                vqtbl1q_s8(vreinterpretq_s8_s16(perm_vec),
-                           vreinterpretq_u8_s16(xor_val)));
+            /* 8-lane int16 table lookup. Narrow xor (int16x8, values in
+             * [0..31]) to 8 u8 indices (low byte of each int16; high byte
+             * is always 0 for these xor values). Look up in the 32-byte
+             * int8 score table via vqtbl2, sign-extend int8x8 back to
+             * int16x8. */
+            uint8x8_t  idx8 = vmovn_u16(vreinterpretq_u16_s16(xor_val));
+            int8x8_t   sbt8 = vqtbl2_s8(perm_vec, idx8);
+            int16x8_t  sbt  = vmovl_s8(sbt8);
 
-            /* Check for boundary */
+            /* Boundary: high bit set in (s1 | s2) indicates padding. */
             int16x8_t or_val = vorrq_s16(s1, s2);
             uint16x8_t high_bit = vshrq_n_u16(vreinterpretq_u16_s16(or_val), 15);
             uint16x8_t is_boundary = vceqq_u16(high_bit, vdupq_n_u16(1));
@@ -868,40 +998,64 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
             int16x8_t m11 = vaddq_s16(h00, sbt);
             m11 = vbslq_s16(is_boundary, zero_vec, m11);
 
-            h11 = vmaxq_s16(m11, e11);
+            int16x8_t h11 = vmaxq_s16(m11, e11);
             h11 = vmaxq_s16(h11, f11);
             h11 = vmaxq_s16(h11, zero_vec);
 
-            /* Update imax tracking */
             uint16x8_t cmp0 = vcgtq_s16(h11, imax_vec);
             imax_vec = vmaxq_s16(imax_vec, h11);
-            iqe_vec = vbslq_s16(cmp0, l_vec, iqe_vec);
+            iqe_vec  = vbslq_s16(cmp0, l_vec, iqe_vec);
 
-            /* Gap extension */
             int16x8_t gapE = vsubq_s16(h11, oe_ins_vec);
             e11 = vsubq_s16(e11, e_ins_vec);
             e11 = vmaxq_s16(gapE, e11);
 
             int16x8_t gapD = vsubq_s16(h11, oe_del_vec);
-            f21 = vsubq_s16(f11, e_del_vec);
+            int16x8_t f21  = vsubq_s16(f11, e_del_vec);
             f21 = vmaxq_s16(gapD, f21);
 
             vst1q_s16(H1 + (j + 1) * SIMD_WIDTH16, h11);
-            vst1q_s16(F + (j + 1) * SIMD_WIDTH16, f21);
+            vst1q_s16(F  + (j + 1) * SIMD_WIDTH16, f21);
             l_vec = vaddq_s16(l_vec, one_vec);
         }
 
+        /* Block I: write prior-row's pimax to rowMax. No intermediate
+         * masking — frozen lanes' imax after the freeze row is still
+         * produced by the DP but the score2 scan filters by per-lane
+         * primary region / minsc / qe, which matches scalar. */
+        if (i > 0) {
+            vst1q_s16(rowMax + (i - 1) * SIMD_WIDTH16, pimax_vec);
+        }
         pimax_vec = imax_vec;
 
-        /* Block II: gmax, te */
+        /* Block II: gmax / te / qe update with per-lane freeze mask. */
         uint16x8_t cmp0 = vcgtq_s16(imax_vec, gmax_vec);
-        gmax_vec = vmaxq_s16(gmax_vec, imax_vec);
-        te_vec = vbslq_s16(cmp0, i_vec, te_vec);
-        qe_vec = vbslq_s16(cmp0, iqe_vec, qe_vec);
+        uint16x8_t frozen_u16 = vreinterpretq_u16_s16(frozen_vec);
+        uint16x8_t cmp0_active = vbicq_u16(cmp0, frozen_u16);
 
-        /* Check end conditions */
-        uint16x8_t cmp_end = vcgeq_s16(gmax_vec, endsc_vec);
-        if (vmaxvq_s16(vreinterpretq_s16_u16(cmp_end)) != 0) {
+        int16x8_t new_gmax = vmaxq_s16(gmax_vec, imax_vec);
+        gmax_vec = vbslq_s16(frozen_u16, gmax_vec, new_gmax);
+
+        te_vec = vbslq_s16(cmp0_active, i_vec, te_vec);
+        qe_vec = vbslq_s16(cmp0_active, iqe_vec, qe_vec);
+
+        /* Freeze newly endsc-qualifying lanes (has_endsc gate prevents
+         * trivial freeze for lanes without a KSW_XSTOP target). */
+        uint16x8_t cmp_end   = vcgeq_s16(gmax_vec, endsc_vec);
+        uint16x8_t just_hit  = vandq_u16(cmp_end, vreinterpretq_u16_s16(has_endsc_vec));
+        frozen_vec = vorrq_s16(frozen_vec, vreinterpretq_s16_u16(just_hit));
+
+        /* Collapse frozen_vec (lanes are 0x0000 or 0xFFFF) to an 8-bit
+         * mask: bit l set iff lane l has hit its KSW_XSTOP target. Uses
+         * the existing _mm_movemask_epi16 helper (extracts each u16
+         * MSB), avoiding the scalar store+loop round-trip. */
+        uint8_t frozen_bits = (uint8_t)_mm_movemask_epi16(vreinterpretq_m128i_s16(frozen_vec));
+
+        /* Early exit only when every lane that *could* freeze has frozen
+         * — i.e. all KSW_XSTOP-carrying lanes are done. Non-XSTOP lanes
+         * (endsc_msk_a bit clear) never contribute to frozen_bits, so the
+         * batched break matches scalar ksw_i16 (no batched global exit). */
+        if (endsc_msk_a != 0 && (frozen_bits & endsc_msk_a) == endsc_msk_a) {
             limit = i++;
             break;
         }
@@ -909,28 +1063,642 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
         int16_t *S = H1; H1 = H0; H0 = S;
     }
 
-    /* Extract results */
+    /* Store final row's pimax. Guard on i > 0 for all-padding batches
+     * (nrow == 0 → i stays at 0 → underflow). See issue 38 / PR 289. */
+    if (i > 0) {
+        vst1q_s16(rowMax + (i - 1) * SIMD_WIDTH16, pimax_vec);
+    }
+
+    /* Extract primary results. */
     int16_t score[SIMD_WIDTH16] __attribute((aligned(128)));
-    int16_t te1[SIMD_WIDTH16] __attribute((aligned(128)));
-    int16_t qe[SIMD_WIDTH16] __attribute((aligned(128)));
-
+    int16_t te1[SIMD_WIDTH16]   __attribute((aligned(128)));
+    int16_t qe[SIMD_WIDTH16]    __attribute((aligned(128)));
     vst1q_s16(score, gmax_vec);
-    vst1q_s16(te1, te_vec);
-    vst1q_s16(qe, qe_vec);
+    vst1q_s16(te1,   te_vec);
+    vst1q_s16(qe,    qe_vec);
 
+    int live = 0;
     for (int l = 0; l < SIMD_WIDTH16 && (po_ind + l) < numPairs; l++) {
         int ind = po_ind + l;
 #if !MAINY
         ind = p[l].regid;
-#endif
+        if (phase) {
+            if (aln[ind].score == score[l]) {
+                aln[ind].tb = aln[ind].te - te1[l];
+                aln[ind].qb = aln[ind].qe - qe[l];
+            }
+        } else {
+            aln[ind].score = score[l];
+            aln[ind].te    = te1[l];
+            aln[ind].qe    = qe[l];
+            if (score[l] > 0) { qe[l] = 1; live++; } else qe[l] = 0;
+        }
+#else
         aln[ind].score = score[l];
-        aln[ind].te = te1[l];
-        aln[ind].qe = qe[l];
-        aln[ind].score2 = -1;
-        aln[ind].te2 = -1;
+        aln[ind].te    = te1[l];
+        aln[ind].qe    = qe[l];
+        if (score[l] > 0) { qe[l] = 1; live++; } else qe[l] = 0;
+#endif
+    }
+
+#if !MAINY
+    if (phase) return 1;
+#endif
+    if (live == 0) return 1;
+
+    /* Score2 / te2 via per-lane scalar b[]-emulation over the now-
+     * populated rowMax. Identical semantics to the 8-bit kernel's
+     * score2 scan; differs only in int16_t types and SIMD_WIDTH16 stride. */
+    int qmax = this->g_qmax;
+    int16_t low[SIMD_WIDTH16]  __attribute((aligned(128)));
+    int16_t high[SIMD_WIDTH16] __attribute((aligned(128)));
+    for (int j = 0; j < SIMD_WIDTH16; j++) {
+        int val = (score[j] + qmax - 1) / qmax;
+        low[j]  = te1[j] - val;
+        high[j] = te1[j] + val;
+    }
+
+    /* rowMax entries produced: i == nrow on normal completion, and
+     * i == limit + 1 after early exit via KSW_XSTOP (limit = i++ stores
+     * the old i). Using i directly covers both paths and includes the
+     * terminating row stored at rowMax[i-1]. */
+    const int processed_rows = i;
+
+    for (int l = 0; l < SIMD_WIDTH16 && (po_ind + l) < numPairs; l++) {
+        int ind = p[l].regid;
+        /* Match scalar ksw_i16: when KSW_XSUBO is absent, minsc = 0x10000
+         * so the b[] list never starts and score2/te2 stay at -1.
+         * minsc_msk_a tracks lanes with KSW_XSUBO set; lanes not in the
+         * mask have minsc[l] zero-initialized and must skip the scan.
+         *
+         * The !qe[l] liveness check is equivalent to kswv512_16's
+         * te[l] < 0: the extraction block above overwrites qe[l] with
+         * 1 (score > 0) or 0 as a liveness flag before this scan runs,
+         * so !qe[l] cleanly marks lanes with no primary alignment. Do
+         * not rewrite to te[l] < 0 without also reverting that
+         * liveness-flag overwrite. */
+        if (!qe[l] || !(minsc_msk_a & (1u << l))) {
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
+            continue;
+        }
+
+        int len1_l  = (int)p[l].len1;
+        int low_l   = (int)low[l];
+        int high_l  = (int)high[l];
+        int minsc_l = (int)minsc[l];
+        int score2  = -1;
+        int te2     = -1;
+        int b_score = -1;
+        int b_pos   = -2;
+
+        int nrows = processed_rows < len1_l ? processed_rows : len1_l;
+        for (int i2 = 0; i2 < nrows; i2++) {
+            int imax = (int)rowMax[i2 * SIMD_WIDTH16 + l];
+            if (imax < minsc_l) continue;
+
+            if (b_pos + 1 != i2) {
+                if (b_pos >= 0 &&
+                    (b_pos < low_l || b_pos > high_l) &&
+                    b_score > score2) {
+                    score2 = b_score;
+                    te2    = b_pos;
+                }
+                b_score = imax;
+                b_pos   = i2;
+            } else if (b_score < imax) {
+                b_score = imax;
+                b_pos   = i2;
+            }
+        }
+
+        if (b_pos >= 0 &&
+            (b_pos < low_l || b_pos > high_l) &&
+            b_score > score2) {
+            score2 = b_score;
+            te2    = b_pos;
+        }
+
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
 
     return 1;
+}
+
+#elif ((!__AVX512BW__) & (__AVX2__))
+/* AVX2 kswv kernel — 256-bit vectors, 32 u8 lanes per batch.
+ *
+ * Direct port of the corrected NEON kernel (kswv_neon_u8 above) with all
+ * four bug fixes pre-applied (te split, freeze mask, per-lane score2
+ * exclusion, minsc filter in score2 scan).
+ *
+ * Intrinsic translation notes:
+ *   - No unsigned 8-bit compare in AVX2 → sign-flip trick:
+ *       cmpgt_u8(a, b) = cmpgt_i8(a ^ 0x80, b ^ 0x80)
+ *   - No 8-bit shift → isolate high bit via sign compare against zero.
+ *   - 16-byte lookup table → broadcast to 256 bits then shuffle
+ *     (shuffle_epi8 is 128-bit-lane; broadcast makes both lanes
+ *     identical so any 0..15 index lands on the correct byte).
+ *   - te uses SIMD_WIDTH8=32 lanes worth of int16 → two __m256i
+ *     (te_vec_lo = pairs 0..15, te_vec_hi = pairs 16..31).
+ */
+
+#include <immintrin.h>
+
+static inline __m256i avx2_cmpgt_u8(__m256i a, __m256i b)
+{
+    const __m256i sign = _mm256_set1_epi8((char)0x80);
+    return _mm256_cmpgt_epi8(_mm256_xor_si256(a, sign),
+                             _mm256_xor_si256(b, sign));
+}
+
+static inline __m256i avx2_cmpge_u8(__m256i a, __m256i b)
+{
+    /* a >= b  <=>  b <= a  <=>  max(a,b) == a */
+    return _mm256_cmpeq_epi8(_mm256_max_epu8(a, b), a);
+}
+
+/* NEON-style select: pick src where mask byte is 0xFF, else dst.
+ * _mm256_blendv_epi8(dst, src, mask) uses the SIGN bit of each mask
+ * byte: 0xFF (sign=1) picks src, 0x00 picks dst. Matches NEON's
+ * vbslq_u8(mask, src, dst). */
+static inline __m256i avx2_blendv_u8(__m256i mask, __m256i src, __m256i dst)
+{
+    return _mm256_blendv_epi8(dst, src, mask);
+}
+
+/* Widen the low/high 128 bits of a u8x32 into u16x16, zero-extended. */
+static inline __m256i avx2_widen_u8_lo(__m256i v)
+{
+    return _mm256_cvtepu8_epi16(_mm256_extracti128_si256(v, 0));
+}
+static inline __m256i avx2_widen_u8_hi(__m256i v)
+{
+    return _mm256_cvtepu8_epi16(_mm256_extracti128_si256(v, 1));
+}
+
+/* Signed 16-bit compares are provided directly by AVX2 (_mm256_cmpgt_epi16,
+ * _mm256_cmpeq_epi16). No cmplt / cmpge; synthesize. */
+static inline __m256i avx2_cmplt_s16(__m256i a, __m256i b)
+{
+    return _mm256_cmpgt_epi16(b, a);
+}
+static inline __m256i avx2_cmpgt_s16(__m256i a, __m256i b)
+{
+    return _mm256_cmpgt_epi16(a, b);
+}
+
+int kswv::kswv256_u8(uint8_t seq1SoA[],
+                     uint8_t seq2SoA[],
+                     int16_t nrow,
+                     int16_t ncol,
+                     SeqPair *p,
+                     kswr_t *aln,
+                     int po_ind,
+                     uint16_t tid,
+                     int32_t numPairs,
+                     int phase)
+{
+    uint8_t minsc[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
+    uint8_t endsc[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
+
+    const __m256i zero_vec = _mm256_setzero_si256();
+    const __m256i one_vec  = _mm256_set1_epi8(1);
+
+    /* Score lookup table (16 bytes). Indexed by (s1 ^ s2). */
+    int8_t temp[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
+
+    uint8_t shift;
+    shift = min_(this->w_match, (int8_t)this->w_mismatch);
+    shift = min_((int8_t)shift, this->w_ambig);
+    shift = 256 - (uint8_t)shift;
+
+    temp[0] = this->w_match;
+    temp[1] = temp[2] = temp[3] = this->w_mismatch;
+    temp[4] = temp[5] = temp[6] = temp[7] = this->w_ambig;
+    temp[8] = temp[9] = temp[10] = temp[11] = this->w_ambig;
+    temp[12] = this->w_ambig;
+    for (int i = 0; i < 16; i++) temp[i] += shift;
+
+    /* Broadcast 16-byte table across both 128-bit lanes of a 256-bit
+     * vector so _mm256_shuffle_epi8 (128-bit-lane) still hits the right
+     * entry for any 0..15 index. */
+    __m128i permSft_128 = _mm_loadu_si128((const __m128i*)temp);
+    __m256i permSft     = _mm256_broadcastsi128_si256(permSft_128);
+    __m256i sft_vec     = _mm256_set1_epi8((char)shift);
+
+    uint32_t minsc_msk_a = 0, endsc_msk_a = 0;
+    for (int i = 0; i < SIMD_WIDTH8; i++) {
+        int xtra = p[i].h0;
+        int val  = (xtra & KSW_XSUBO) ? (xtra & 0xffff) : 0x10000;
+        if (val <= 255) { minsc[i] = (uint8_t)val; minsc_msk_a |= (1u << i); }
+        val = (xtra & KSW_XSTOP) ? (xtra & 0xffff) : 0x10000;
+        if (val <= 255) { endsc[i] = (uint8_t)val; endsc_msk_a |= (1u << i); }
+    }
+
+    const __m256i minsc_vec  = _mm256_loadu_si256((const __m256i*)minsc);
+    const __m256i endsc_vec  = _mm256_loadu_si256((const __m256i*)endsc);
+    const __m256i e_del_vec  = _mm256_set1_epi8((char)this->e_del);
+    const __m256i oe_del_vec = _mm256_set1_epi8((char)(this->o_del + this->e_del));
+    const __m256i e_ins_vec  = _mm256_set1_epi8((char)this->e_ins);
+    const __m256i oe_ins_vec = _mm256_set1_epi8((char)(this->o_ins + this->e_ins));
+    const __m256i five_vec   = _mm256_set1_epi8((char)DUMMY5);
+    const __m256i cmax_vec   = _mm256_set1_epi8((char)255);
+
+    __m256i gmax_vec   = zero_vec;
+    /* Fix 1: split te into two int16 vectors covering 32 pairs. */
+    __m256i te_vec_lo  = _mm256_set1_epi16(-1);  /* pairs 0..15 */
+    __m256i te_vec_hi  = _mm256_set1_epi16(-1);  /* pairs 16..31 */
+    /* Fix 2: per-lane freeze once pair hits KSW_XSTOP. */
+    __m256i frozen_vec = zero_vec;
+
+    /* Fix 2 helper: only freeze lanes that actually set an endsc target.
+     * endsc_vec defaults to 0 for lanes without a target (compares
+     * trivially true with vcgeq_u8) — has_endsc_vec masks that out. */
+    uint8_t _has_endsc_bytes[SIMD_WIDTH8];
+    for (int i = 0; i < SIMD_WIDTH8; i++)
+        _has_endsc_bytes[i] = (endsc_msk_a & (1u << i)) ? 0xFF : 0x00;
+    __m256i has_endsc_vec = _mm256_loadu_si256((const __m256i*)_has_endsc_bytes);
+
+    uint32_t exit0 = 0xFFFFFFFFu;
+
+    tid = 0;
+    uint8_t *H0     = H8_0    + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *H1     = H8_1    + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *Hmax   = H8_max  + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *F      = F8      + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
+
+    for (int i = 0; i <= ncol; i++) {
+        _mm256_storeu_si256((__m256i*)(H0   + i * SIMD_WIDTH8), zero_vec);
+        _mm256_storeu_si256((__m256i*)(Hmax + i * SIMD_WIDTH8), zero_vec);
+        _mm256_storeu_si256((__m256i*)(F    + i * SIMD_WIDTH8), zero_vec);
+    }
+    _mm256_storeu_si256((__m256i*)H0, zero_vec);
+    _mm256_storeu_si256((__m256i*)H1, zero_vec);
+
+    __m256i pimax_vec = zero_vec;
+    uint32_t mask32   = 0;
+
+    __m256i imax_vec;
+    __m256i qe_vec = zero_vec;
+
+    int i, limit = nrow;
+    for (i = 0; i < nrow; i++) {
+        __m256i e11 = zero_vec;
+        __m256i s1  = _mm256_loadu_si256((const __m256i*)(seq1SoA + i * SIMD_WIDTH8));
+        imax_vec    = zero_vec;
+        __m256i iqe_vec = _mm256_set1_epi8((char)0xFF);
+        __m256i l_vec = zero_vec;
+        __m256i i_vec_s16 = _mm256_set1_epi16((int16_t)i);
+
+        for (int j = 0; j < ncol; j++) {
+            __m256i h00 = _mm256_loadu_si256((const __m256i*)(H0 + j * SIMD_WIDTH8));
+            __m256i s2  = _mm256_loadu_si256((const __m256i*)(seq2SoA + j * SIMD_WIDTH8));
+            __m256i f11 = _mm256_loadu_si256((const __m256i*)(F + (j + 1) * SIMD_WIDTH8));
+
+            __m256i xor_val = _mm256_xor_si256(s1, s2);
+            __m256i sbt     = _mm256_shuffle_epi8(permSft, xor_val);
+
+            __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec);
+            sbt = avx2_blendv_u8(cmpq, sft_vec, sbt);
+
+            /* High bit of (s1 | s2) indicates boundary (padding 0xFF).
+             * Sign compare against zero gives 0xFF wherever high bit is
+             * set in the u8 byte. */
+            __m256i or_val      = _mm256_or_si256(s1, s2);
+            __m256i is_boundary = _mm256_cmpgt_epi8(zero_vec, or_val);
+
+            __m256i m11 = _mm256_adds_epu8(h00, sbt);
+            m11 = avx2_blendv_u8(is_boundary, zero_vec, m11);
+            m11 = _mm256_subs_epu8(m11, sft_vec);
+
+            __m256i h11 = _mm256_max_epu8(m11, e11);
+            h11 = _mm256_max_epu8(h11, f11);
+
+            __m256i cmp0 = avx2_cmpgt_u8(h11, imax_vec);
+            imax_vec = _mm256_max_epu8(imax_vec, h11);
+            iqe_vec  = avx2_blendv_u8(cmp0, l_vec, iqe_vec);
+
+            __m256i gapE = _mm256_subs_epu8(h11, oe_ins_vec);
+            e11 = _mm256_subs_epu8(e11, e_ins_vec);
+            e11 = _mm256_max_epu8(gapE, e11);
+
+            __m256i gapD = _mm256_subs_epu8(h11, oe_del_vec);
+            __m256i f21  = _mm256_subs_epu8(f11, e_del_vec);
+            f21 = _mm256_max_epu8(gapD, f21);
+
+            _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH8), h11);
+            _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), f21);
+            l_vec = _mm256_add_epi8(l_vec, one_vec);
+        }
+
+        /* Block I - rowMax tracking. Same shape as NEON. */
+        if (i > 0) {
+            __m256i cmp_gt = avx2_cmpgt_u8(imax_vec, pimax_vec);
+            uint32_t msk32 = (uint32_t)_mm256_movemask_epi8(cmp_gt);
+            msk32 |= mask32;
+            pimax_vec = avx2_blendv_u8(cmp_gt, zero_vec, pimax_vec);
+            _mm256_storeu_si256((__m256i*)(rowMax + (i - 1) * SIMD_WIDTH8), pimax_vec);
+            mask32 = ~msk32;
+        }
+        pimax_vec = imax_vec;
+
+        /* Block II: gmax, te with freeze mask (fix 2) */
+        __m256i cmp0 = avx2_cmpgt_u8(imax_vec, gmax_vec);
+        uint32_t cmp0_msk = (uint32_t)_mm256_movemask_epi8(cmp0);
+        cmp0_msk &= exit0;
+
+        /* 16-bit mirrors of cmp0 for te update (fix 1 split) */
+        __m256i cmp_lo_16 = avx2_cmpgt_s16(
+            avx2_widen_u8_lo(imax_vec), avx2_widen_u8_lo(gmax_vec));
+        __m256i cmp_hi_16 = avx2_cmpgt_s16(
+            avx2_widen_u8_hi(imax_vec), avx2_widen_u8_hi(gmax_vec));
+
+        /* 16-bit mirrors of frozen_vec to mask te updates. */
+        __m256i frozen_lo_16 = avx2_cmpgt_s16(
+            avx2_widen_u8_lo(frozen_vec), _mm256_setzero_si256());
+        __m256i frozen_hi_16 = avx2_cmpgt_s16(
+            avx2_widen_u8_hi(frozen_vec), _mm256_setzero_si256());
+
+        cmp_lo_16 = _mm256_andnot_si256(frozen_lo_16, cmp_lo_16);
+        cmp_hi_16 = _mm256_andnot_si256(frozen_hi_16, cmp_hi_16);
+        __m256i cmp0_active = _mm256_andnot_si256(frozen_vec, cmp0);
+
+        __m256i new_gmax = _mm256_max_epu8(gmax_vec, imax_vec);
+        gmax_vec = avx2_blendv_u8(frozen_vec, gmax_vec, new_gmax);
+
+        te_vec_lo = avx2_blendv_u8(cmp_lo_16, i_vec_s16, te_vec_lo);
+        te_vec_hi = avx2_blendv_u8(cmp_hi_16, i_vec_s16, te_vec_hi);
+        qe_vec    = avx2_blendv_u8(cmp0_active, iqe_vec, qe_vec);
+
+        /* End-score check + freeze update. */
+        __m256i cmp_end = avx2_cmpge_u8(gmax_vec, endsc_vec);
+        uint32_t cmp_end_msk = (uint32_t)_mm256_movemask_epi8(cmp_end);
+        cmp_end_msk &= endsc_msk_a;
+
+        __m256i just_hit = _mm256_and_si256(cmp_end, has_endsc_vec);
+        frozen_vec = _mm256_or_si256(frozen_vec, just_hit);
+
+        /* Overflow check. */
+        __m256i left_vec = _mm256_adds_epu8(gmax_vec, sft_vec);
+        __m256i cmp2     = avx2_cmpge_u8(left_vec, cmax_vec);
+        uint32_t cmp2_msk = (uint32_t)_mm256_movemask_epi8(cmp2);
+
+        exit0 = (~(cmp_end_msk | cmp2_msk)) & exit0;
+        if (exit0 == 0) { limit = i++; break; }
+
+        uint8_t *S = H1; H1 = H0; H0 = S;
+    }
+
+    /* Guard on i > 0: when every pair in the batch has len1 == 0, nrow
+     * is 0, the DP loop never runs, and `i - 1` underflows into the
+     * rowMax allocation prefix. See issue 38 / upstream PR 289. */
+    if (i > 0) {
+        _mm256_storeu_si256((__m256i*)(rowMax + (i - 1) * SIMD_WIDTH8), pimax_vec);
+    }
+
+    /* Extract results. */
+    uint8_t score[SIMD_WIDTH8] __attribute__((aligned(64)));
+    int16_t te1[SIMD_WIDTH8]    __attribute__((aligned(64)));
+    uint8_t qe[SIMD_WIDTH8]     __attribute__((aligned(64)));
+
+    _mm256_storeu_si256((__m256i*)score, gmax_vec);
+    _mm256_storeu_si256((__m256i*)te1, te_vec_lo);        /* pairs 0..15 */
+    _mm256_storeu_si256((__m256i*)(te1 + 16), te_vec_hi); /* pairs 16..31 */
+    _mm256_storeu_si256((__m256i*)qe, qe_vec);
+
+    int live = 0;
+    for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
+        int ind = p[l].regid;
+        int16_t *te = te1;
+        if (phase) {
+            if (aln[ind].score == score[l]) {
+                aln[ind].tb = aln[ind].te - te[l];
+                aln[ind].qb = aln[ind].qe - qe[l];
+            }
+        } else {
+            aln[ind].score = score[l] + shift < 255 ? score[l] : 255;
+            aln[ind].te = te[l];
+            aln[ind].qe = qe[l];
+            if (aln[ind].score != 255) { qe[l] = 1; live++; }
+            else qe[l] = 0;
+        }
+    }
+
+    if (phase) return 1;
+    if (live == 0) return 1;
+
+    /* Score2 and te2 computation.
+     *
+     * The SIMD dense-rowMax approach (max2 over every row outside the
+     * primary region) diverges from scalar ksw_u8 on plateaus: scalar
+     * collapses consecutive rows >= minsc into a single b[] entry
+     * anchored at the max-score row, so a plateau straddling the primary
+     * region boundary (anchor inside, later rows outside) is excluded
+     * entirely. Dense rowMax would otherwise pull partial-plateau rows
+     * in and inflate `sub`. Emulate scalar exactly, per lane, on the
+     * precomputed rowMax. Cost is O(SIMD_WIDTH8 * limit) scalar ops per
+     * batch, negligible next to the SIMD DP. */
+    int qmax = this->g_qmax;
+    int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
+    int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
+    for (int j = 0; j < SIMD_WIDTH8; j++) {
+        int val = (score[j] + qmax - 1) / qmax;
+        low[j]  = te1[j] - val;
+        high[j] = te1[j] + val;
+    }
+
+    /* rowMax entries produced: i == limit on normal completion, and
+     * i == limit + 1 after early exit (limit = i++ stores old i). Using i
+     * directly gives a single expression that covers both exit paths and
+     * includes the terminating row stored at rowMax[limit]. */
+    const int processed_rows = i;
+
+    for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
+        int ind = p[l].regid;
+        /* Match scalar ksw_u8: when KSW_XSUBO is absent, minsc = 0x10000
+         * so the b[] list never starts and score2/te2 stay at -1.
+         * minsc_msk_a tracks lanes with KSW_XSUBO set; lanes not in the
+         * mask have minsc[l] zero-initialized and must skip the scan. */
+        if (!qe[l] || !(minsc_msk_a & (1u << l))) {
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
+            continue;
+        }
+
+        int len1_l  = (int)p[l].len1;
+        int low_l   = (int)low[l];
+        int high_l  = (int)high[l];
+        int minsc_l = (int)minsc[l];
+        int score2  = -1;
+        int te2     = -1;
+        /* b_pos = -2 sentinel: (-2 + 1) != any real row index, forces
+         * an "append" on first qualifying row. */
+        int b_score = -1;
+        int b_pos   = -2;
+
+        int nrows = processed_rows < len1_l ? processed_rows : len1_l;
+        for (int i2 = 0; i2 < nrows; i2++) {
+            int imax = (int)rowMax[i2 * SIMD_WIDTH8 + l];
+            if (imax < minsc_l) continue;
+
+            if (b_pos + 1 != i2) {
+                /* APPEND: flush the outgoing b[] entry to score2 first. */
+                if (b_pos >= 0 &&
+                    (b_pos < low_l || b_pos > high_l) &&
+                    b_score > score2) {
+                    score2 = b_score;
+                    te2    = b_pos;
+                }
+                b_score = imax;
+                b_pos   = i2;
+            } else if (b_score < imax) {
+                /* UPDATE: strict greater extends the run's anchor. Equal
+                 * imax leaves b_pos in place (matches scalar). */
+                b_score = imax;
+                b_pos   = i2;
+            }
+        }
+
+        /* Flush trailing b[] entry. */
+        if (b_pos >= 0 &&
+            (b_pos < low_l || b_pos > high_l) &&
+            b_score > score2) {
+            score2 = b_score;
+            te2    = b_pos;
+        }
+
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
+    }
+
+    return 1;
+}
+
+void kswv::kswvBatchWrapper8_avx2(SeqPair *pairArray,
+                                  uint8_t *seqBufRef,
+                                  uint8_t *seqBufQer,
+                                  kswr_t* aln,
+                                  int32_t numPairs,
+                                  uint16_t numThreads,
+                                  int phase)
+{
+    uint8_t *seq1SoA = (uint8_t*)_mm_malloc(
+        (size_t)this->maxRefLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 128);
+    uint8_t *seq2SoA = (uint8_t*)_mm_malloc(
+        (size_t)this->maxQerLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 128);
+    assert(seq1SoA && seq2SoA);
+
+    int32_t roundNumPairs = ((numPairs + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) * SIMD_WIDTH8;
+    for (int32_t ii = numPairs; ii < roundNumPairs; ii++) {
+        pairArray[ii].regid = ii;
+        pairArray[ii].id    = ii;
+        pairArray[ii].len1  = 0;
+        pairArray[ii].len2  = 0;
+    }
+
+    uint16_t tid = 0;
+    uint8_t *mySeq1SoA = seq1SoA + tid * this->maxRefLen * SIMD_WIDTH8;
+    uint8_t *mySeq2SoA = seq2SoA + tid * this->maxQerLen * SIMD_WIDTH8;
+
+    for (int32_t i = 0; i < numPairs; i += SIMD_WIDTH8) {
+        int maxLen1 = 0, maxLen2 = 0;
+
+        for (int j = 0; j < SIMD_WIDTH8; j++) {
+            SeqPair sp = pairArray[i + j];
+            uint8_t *seq1 = seqBufRef + sp.idr;
+            for (int k = 0; k < sp.len1; k++)
+                mySeq1SoA[k * SIMD_WIDTH8 + j] = (seq1[k] == AMBIG_ ? AMBR : seq1[k]);
+            if (maxLen1 < sp.len1) maxLen1 = sp.len1;
+        }
+        for (int j = 0; j < SIMD_WIDTH8; j++) {
+            SeqPair sp = pairArray[i + j];
+            for (int k = sp.len1; k <= maxLen1; k++)
+                mySeq1SoA[k * SIMD_WIDTH8 + j] = 0xFF;
+        }
+
+        for (int j = 0; j < SIMD_WIDTH8; j++) {
+            SeqPair sp = pairArray[i + j];
+            uint8_t *seq2 = seqBufQer + sp.idq;
+            int quanta = ((sp.len2 + 16 - 1) / 16) * 16;
+            for (int k = 0; k < sp.len2; k++)
+                mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k] == AMBIG_ ? AMBQ : seq2[k]);
+            for (int k = sp.len2; k < quanta; k++)
+                mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY5;
+            if (maxLen2 < quanta) maxLen2 = quanta;
+        }
+        for (int j = 0; j < SIMD_WIDTH8; j++) {
+            SeqPair sp = pairArray[i + j];
+            int quanta = ((sp.len2 + 16 - 1) / 16) * 16;
+            for (int k = quanta; k <= maxLen2; k++)
+                mySeq2SoA[k * SIMD_WIDTH8 + j] = 0xFF;
+        }
+
+        kswv256_u8(mySeq1SoA, mySeq2SoA,
+                   (int16_t)maxLen1, (int16_t)maxLen2,
+                   pairArray + i, aln, i, tid,
+                   numPairs, phase);
+    }
+
+    _mm_free(seq1SoA);
+    _mm_free(seq2SoA);
+}
+
+void kswv::getScores8(SeqPair *pairArray,
+                      uint8_t *seqBufRef,
+                      uint8_t *seqBufQer,
+                      kswr_t *aln,
+                      int32_t numPairs,
+                      uint16_t numThreads,
+                      int phase)
+{
+    kswvBatchWrapper8_avx2(pairArray, seqBufRef, seqBufQer, aln,
+                           numPairs, numThreads, phase);
+}
+
+/* getScores16 remains a scalar fallback for now. The 16-bit NEON kernel
+ * also has a full SIMD port — a parallel AVX2 port is a mechanical
+ * follow-up after 8-bit lands. Most production mate-rescue traffic takes
+ * the 8-bit path (KSW_XBYTE set when l_ms * w_match < 250). */
+void kswv::getScores16(SeqPair *pairArray,
+                       uint8_t *seqBufRef,
+                       uint8_t *seqBufQer,
+                       kswr_t *aln,
+                       int32_t numPairs,
+                       uint16_t /*numThreads*/,
+                       int phase)
+{
+    if (phase != 0) return;
+
+    int8_t mat[25];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            mat[i*5 + j] = (i == j) ? this->w_match : this->w_mismatch;
+        }
+        mat[i*5 + 4] = this->w_ambig;
+        mat[4*5 + i] = this->w_ambig;
+    }
+    mat[24] = this->w_ambig;
+
+    for (int i = 0; i < numPairs; i++) {
+        SeqPair *p = pairArray + i;
+        kswr_t  *myaln = aln + p->regid;
+        uint8_t *target = seqBufRef + p->idr;
+        uint8_t *query  = seqBufQer + p->idq;
+        kswr_t ks = ksw_align2(p->len2, query, p->len1, target, 5, mat,
+                               this->o_del, this->e_del,
+                               this->o_ins, this->e_ins,
+                               p->h0, nullptr);
+        myaln->score  = ks.score;
+        myaln->qe     = ks.qe;
+        myaln->te     = ks.te;
+        myaln->qb     = ks.qb;
+        myaln->tb     = ks.tb;
+        myaln->score2 = ks.score2;
+        myaln->te2    = ks.te2;
+    }
 }
 
 #elif __AVX512BW__
@@ -1323,17 +2091,20 @@ int kswv::kswv512_u8(uint8_t seq1SoA[],
     pimax512 = _mm512_mask_blend_epi8(mask512, pimax512, zero512);
     pimax512 = _mm512_mask_blend_epi8(minsc_msk, zero512, pimax512);
     pimax512 = _mm512_mask_blend_epi8(exit0, zero512, pimax512);
-    _mm512_store_si512((__m512i *) (rowMax + (i-1) * SIMD_WIDTH8), pimax512);
+    /* Guard on i > 0: all-len1==0 batches give nrow == 0 and would
+     * otherwise underflow into the rowMax allocation. issue 38 / PR 289. */
+    if (i > 0) {
+        _mm512_store_si512((__m512i *) (rowMax + (i-1) * SIMD_WIDTH8), pimax512);
+    }
 
-    /******************* DP loop over *****************************/   
+    /******************* DP loop over *****************************/
     /**************** Partial output setting **********************/
     uint8_t score[SIMD_WIDTH8] __attribute((aligned(64)));
-    int16_t te1[SIMD_WIDTH8] __attribute((aligned(64)));    
-    uint8_t qe[SIMD_WIDTH8] __attribute((aligned(64)));    
-    int16_t low[SIMD_WIDTH8] __attribute((aligned(64)));
-    int16_t high[SIMD_WIDTH8] __attribute((aligned(64)));
-    
-    _mm512_store_si512((__m512i *) score, gmax512); 
+    int16_t te1[SIMD_WIDTH8] __attribute((aligned(64)));
+    uint8_t qe[SIMD_WIDTH8] __attribute((aligned(64)));
+    /* low[]/high[] are declared inside the score2 block below. */
+
+    _mm512_store_si512((__m512i *) score, gmax512);
     _mm512_store_si512((__m512i *) te1, te512);
     _mm512_store_si512((__m512i *) (te1 + SIMD_WIDTH16), te512_);
     _mm512_store_si512((__m512i *) qe, qe512);
@@ -1379,104 +2150,89 @@ int kswv::kswv512_u8(uint8_t seq1SoA[],
 
     if (live == 0) return 1;
 
-    /*************** Score2 and te2 *******************/
+    /* Score2 and te2 computation.
+     *
+     * Per-lane scalar emulation of ksw_u8's b[] build + score2 scan
+     * (src/ksw.cpp:201). scalar ksw_u8 collapses consecutive rows >=
+     * minsc into a single b[] entry anchored at the max-score row; a
+     * plateau straddling the primary region [te - val, te + val] is
+     * excluded entirely when its anchor lies inside. A dense SIMD scan
+     * treats every row independently and pulls out-of-region rows of a
+     * boundary-straddling plateau in as false suboptimals, inflating `sub`.
+     * Emulate scalar exactly, per lane, on the precomputed
+     * rowMax. Cost is O(SIMD_WIDTH8 * limit) scalar ops per batch,
+     * negligible next to the SIMD DP that built rowMax. */
     int qmax = this->g_qmax;
-    int maxl = 0 , minh = nrow;
-    for (int i=0; i<SIMD_WIDTH8; i++)
-    {
-        int val = (score[i] + qmax - 1) / qmax;
-
-        int16_t *te;
-        if (i < SIMD_WIDTH16) te = te1;
-        else te = te1;
-
-        low[i] = te[i] - val;
-        high[i] = te[i] + val;
-        if (qe[i]) {
-            maxl = maxl < low[i] ? low[i] : maxl;
-            minh = minh > high[i] ? high[i] : minh;
-        }
+    int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
+    int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
+    for (int j = 0; j < SIMD_WIDTH8; j++) {
+        int val = (score[j] + qmax - 1) / qmax;
+        low[j]  = te1[j] - val;
+        high[j] = te1[j] + val;
     }
 
-    max512 = zero512;
-    te512 = _mm512_set1_epi16(-1);
-    te512_ = _mm512_set1_epi16(-1);
-    __m512i low512 = _mm512_load_si512((__m512i*) low);    // make it int16
-    __m512i high512 = _mm512_load_si512((__m512i*) high);  // int16
-    __m512i low512_ = _mm512_load_si512((__m512i*) (low + SIMD_WIDTH16));    // make it int16
-    __m512i high512_ = _mm512_load_si512((__m512i*) (high + SIMD_WIDTH16));  // int16
+    /* rowMax entries produced: i == limit on normal completion, and
+     * i == limit + 1 after early exit (limit = i++ stores old i). Using i
+     * directly gives a single expression that covers both exit paths and
+     * includes the terminating row stored at rowMax[limit]. */
+    const int processed_rows = i;
 
-    
-    __m512i rmax512;
-    for (int i=0; i< maxl; i++)
-    {
-        __m512i i512 = _mm512_set1_epi16(i);
-        rmax512 = _mm512_load_si512((__m512i*) (rowMax + i*SIMD_WIDTH8));
-
-        __mmask64 mask11 = _mm512_cmpgt_epi16_mask(low512, i512);
-        __mmask64 mask12 = _mm512_cmpgt_epi16_mask(low512_, i512);
-        __mmask64 mask2 = _mm512_cmpgt_epu8_mask(rmax512, max512);
-        __mmask64 mask1 = mask11 | (mask12 << SIMD_WIDTH16);        
-        mask2 &= mask1;
-        max512 = _mm512_mask_blend_epi8(mask2, max512, rmax512);
-        te512  = _mm512_mask_blend_epi16(mask2, te512, i512);
-        te512_ = _mm512_mask_blend_epi16(mask2 >> SIMD_WIDTH16, te512_, i512);
-    }   
-
-    // Added new block -- due to bug
-    int16_t rlen[SIMD_WIDTH8] __attribute((aligned(64)));
-    for (int i=0; i<SIMD_WIDTH8; i++) rlen[i] = p[i].len1;
-    __m512i rlen512 = _mm512_load_si512(rlen);
-    __m512i rlen512_ = _mm512_load_si512(rlen + SIMD_WIDTH16);
-
-    static bool flg = 1;
-    for (int i=minh+1; i<limit; i++)
-    //for (int i=minh; i<limit; i++)
-    {
-        __m512i i512 = _mm512_set1_epi16(i);
-        rmax512 = _mm512_load_si512((__m512i*) (rowMax + i*SIMD_WIDTH8));
-        __mmask64 mask11 = _mm512_cmpgt_epi16_mask(i512, high512);
-        __mmask64 mask12 = _mm512_cmpgt_epi16_mask(i512, high512_);
-        __mmask64 mask2 = _mm512_cmpgt_epu8_mask(rmax512, max512);
-        __mmask64 mask1 = mask11 | (mask12 << SIMD_WIDTH16);
-        mask2 &= mask1;
-        // new, bug
-        __mmask64 mask11_ = _mm512_cmpgt_epi16_mask(rlen512, i512);
-        __mmask64 mask12_ = _mm512_cmpgt_epi16_mask(rlen512_, i512);
-        __mmask64 mask1_ = mask11_ | (mask12_ << SIMD_WIDTH16);
-        mask2 &= mask1_;        
-        max512 = _mm512_mask_blend_epi8(mask2, max512, rmax512);
-        te512 = _mm512_mask_blend_epi16(mask2, te512, i512);
-        te512_ = _mm512_mask_blend_epi16(mask2 >> SIMD_WIDTH16, te512_, i512);
-    }
-    
-    int16_t temp4[SIMD_WIDTH8] __attribute((aligned(64)));
-    _mm512_store_si512((__m512i *) temp, max512);
-    _mm512_store_si512((__m512i *) temp4, te512);
-    _mm512_store_si512((__m512i *) (temp4 + SIMD_WIDTH16), te512_);
-    
-    for (int i=0; i<SIMD_WIDTH8  && (po_ind + i) < numPairs; i++)
-    {
-        int ind = po_ind + i;
-        int16_t *te2;
-        // if (i < SIMD_WIDTH16) te2 = temp4;
-        // else te2 = temp4;
-        te2 = temp4;
-#if !MAINY
-        ind = p[i].regid;    // index of corr. aln
-#endif
-        if (qe[i]) {
-            aln[ind].score2 = (temp[i] == 0? (int)-1: (uint8_t) temp[i]);
-            aln[ind].te2 = te2[i];
-        } else {
+    for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
+        int ind = p[l].regid;
+        /* Match scalar ksw_u8: when KSW_XSUBO is absent, minsc = 0x10000
+         * so the b[] list never starts and score2/te2 stay at -1.
+         * minsc_msk_a tracks lanes with KSW_XSUBO set; lanes not in the
+         * mask have minsc[l] zero-initialized and must skip the scan. */
+        if (!qe[l] || !(minsc_msk_a & ((__mmask64)1 << l))) {
             aln[ind].score2 = -1;
-            aln[ind].te2 = -1;
+            aln[ind].te2    = -1;
+            continue;
         }
-        
-#if MAXI
-        fprintf(stderr, "score: %d, te: %d, qe: %d, score2: %d, te2: %d\n",
-                aln[ind].score, aln[ind].te, aln[ind].qe, aln[ind].score2, aln[ind].te2);
-#endif
+
+        int len1_l  = (int)p[l].len1;
+        int low_l   = (int)low[l];
+        int high_l  = (int)high[l];
+        int minsc_l = (int)minsc[l];
+        int score2  = -1;
+        int te2     = -1;
+        /* b_pos = -2 sentinel: (-2 + 1) != any real row, forces an
+         * "append" on the first qualifying row. */
+        int b_score = -1;
+        int b_pos   = -2;
+
+        int nrows = processed_rows < len1_l ? processed_rows : len1_l;
+        for (int i2 = 0; i2 < nrows; i2++) {
+            int imax = (int)rowMax[i2 * SIMD_WIDTH8 + l];
+            if (imax < minsc_l) continue;
+
+            if (b_pos + 1 != i2) {
+                /* APPEND: flush the outgoing b[] entry to score2 first. */
+                if (b_pos >= 0 &&
+                    (b_pos < low_l || b_pos > high_l) &&
+                    b_score > score2) {
+                    score2 = b_score;
+                    te2    = b_pos;
+                }
+                b_score = imax;
+                b_pos   = i2;
+            } else if (b_score < imax) {
+                /* UPDATE: strict greater extends the run's anchor. Equal
+                 * imax leaves b_pos in place (matches scalar). */
+                b_score = imax;
+                b_pos   = i2;
+            }
+        }
+
+        /* Flush trailing b[] entry. */
+        if (b_pos >= 0 &&
+            (b_pos < low_l || b_pos > high_l) &&
+            b_score > score2) {
+            score2 = b_score;
+            te2    = b_pos;
+        }
+
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
 
     return 1;   
@@ -1883,7 +2639,11 @@ int kswv::kswv512_16(int16_t seq1SoA[],
     pimax512 = _mm512_mask_blend_epi16(mask512, pimax512, minus1);
     pimax512 = _mm512_mask_blend_epi16(minsc_msk, minus1, pimax512);
     pimax512 = _mm512_mask_blend_epi16(exit0, minus1, pimax512);
-    _mm512_store_si512((__m512i *) (rowMax + (i-1) * SIMD_WIDTH16), pimax512);
+    /* Guard on i > 0: all-len1==0 batches give nrow == 0 and would
+     * otherwise underflow into the rowMax allocation. issue 38 / PR 289. */
+    if (i > 0) {
+        _mm512_store_si512((__m512i *) (rowMax + (i-1) * SIMD_WIDTH16), pimax512);
+    }
     // __m512i max512_ = max512;
 
     /******************* DP loop over *****************************/
@@ -1922,71 +2682,103 @@ int kswv::kswv512_16(int16_t seq1SoA[],
     if (phase) return 1;
 #endif
 
-    /*************** Score2 and te2 *******************/
-    int qmax = this->g_qmax;    
-    int maxl = 0 , minh = nrow;
-    for (int i=0; i<SIMD_WIDTH16; i++)
-    {
-        int val = (score[i] + qmax - 1) / qmax;
-        low[i] = te[i] - val;
-        high[i] = te[i] + val;
-        maxl = maxl < low[i] ? low[i] : maxl;
-        minh = minh > high[i] ? high[i] : minh;
-    }
-    max512 = _mm512_set1_epi16(-1);
-    te512 = _mm512_set1_epi16(-1);
-    __m512i low512 = _mm512_load_si512((__m512i*) low);
-    __m512i high512 = _mm512_load_si512((__m512i*) high);
-
-    __m512i rmax512;
-    for (int i=0; i< maxl; i++)
-    {
-        __m512i i512 = _mm512_set1_epi16(i);
-        rmax512 = _mm512_load_si512((__m512i*) (rowMax + i*SIMD_WIDTH16));
-        __mmask32 mask1 = _mm512_cmpgt_epi16_mask(low512, i512);
-        __mmask32 mask2 = _mm512_cmpgt_epi16_mask(rmax512, max512);
-        mask2 &= mask1;
-        max512 = _mm512_mask_blend_epi16(mask2, max512, rmax512);
-        te512 = _mm512_mask_blend_epi16(mask2, te512, i512);
-    }   
-
-    // New, due to latest bug
-    int16_t rlen[SIMD_WIDTH16] __attribute((aligned(64)));
-    for (int i=0; i<SIMD_WIDTH16; i++) rlen[i] = p[i].len1;
-    __m512i rlen512 = _mm512_load_si512(rlen);
-
-
-    for (int i=minh+1; i<limit; i++)
-    {
-        __m512i i512 = _mm512_set1_epi16(i);
-        rmax512 = _mm512_load_si512((__m512i*) (rowMax + i*SIMD_WIDTH16));
-        __mmask32 mask1 = _mm512_cmpgt_epi16_mask(i512, high512);
-        __mmask32 mask2 = _mm512_cmpgt_epi16_mask(rmax512, max512);
-        mask2 &= mask1;
-        // new, due to latest bug
-        __mmask32 mask1_ = _mm512_cmpgt_epi16_mask(rlen512, i512);
-        mask2 &= mask1_;
-        max512 = _mm512_mask_blend_epi16(mask2, max512, rmax512);
-        te512 = _mm512_mask_blend_epi16(mask2, te512, i512);    
+    /*************** Score2 and te2 — per-lane scalar emulation *******************
+     *
+     * Same b[]-consolidation fix as the 8-bit kernels (see kswv256_u8 for
+     * full rationale). Additionally fixes three pre-existing bugs the
+     * pre-fix 16-bit kernel carried but 8-bit did not:
+     *
+     *   (a) aggregate maxl/minh bounds — the same fix-3 issue PR #21
+     *       addressed on the AVX-512BW 8-bit kernel; this 16-bit one
+     *       never got it. A lane with a tight primary region would see
+     *       rows inside its own [low, high] count as score2 candidates
+     *       because the outer loop used the batch-wide max(low) /
+     *       min(high) instead of per-lane bounds.
+     *   (b) no minsc filter — scalar ksw_i16 records b[] entries only
+     *       when imax >= minsc; pre-fix 16-bit had no such gate,
+     *       leaking sub-minsc plateau scores into max2.
+     *   (c) no qe mask — lanes without a valid primary (qe == 0) could
+     *       contribute spurious rmax values since their rowMax was
+     *       never zeroed.
+     *
+     * All three fall out of the per-lane scalar loop naturally. */
+    int qmax = this->g_qmax;
+    for (int j = 0; j < SIMD_WIDTH16; j++) {
+        int val = (score[j] + qmax - 1) / qmax;
+        low[j]  = te[j] - val;
+        high[j] = te[j] + val;
     }
 
-    // _mm512_store_si512((__m512i *) temp, max512_);
-    _mm512_store_si512((__m512i *) temp1, max512);
-    _mm512_store_si512((__m512i *) temp2, te512);
+    /* rowMax entries produced: i == limit on normal completion, and
+     * i == limit + 1 after early exit (limit = i++ stores old i). Using i
+     * directly gives a single expression that covers both exit paths and
+     * includes the terminating row stored at rowMax[limit]. */
+    const int processed_rows = i;
 
-    for (int i=0; i<SIMD_WIDTH16 && (po_ind + i) < numPairs; i++) {    
-        int ind = po_ind + i;
-#if !MAINY
-        ind = p[i].regid;    // index of corr. aln
-#endif      
-        aln[ind].score2 = temp1[i];
-        aln[ind].te2 = temp2[i];
-        
-#if MAXI
-        fprintf(stderr, "score: %d, te: %d, qe: %d, score2: %d, te2: %d\n",
-                aln[ind].score, aln[ind].te, aln[ind].qe, temp1[i], temp2[i]);
-#endif
+    for (int l = 0; l < SIMD_WIDTH16 && (po_ind + l) < numPairs; l++) {
+        int ind = p[l].regid;
+        /* Match scalar ksw_i16: when KSW_XSUBO is absent, minsc = 0x10000
+         * (> SHRT_MAX) so b[] never starts and score2/te2 stay at -1.
+         * minsc_msk_a tracks lanes with KSW_XSUBO set; lanes not in the
+         * mask have minsc[l] zero-initialized and must skip the scan.
+         *
+         * Inactive-lane check is te[l] < 0, not !qe[l]: unlike the 8-bit
+         * kernels, 16-bit qe[l] is the real query-end coordinate and
+         * qe == 0 is a valid endpoint (best cell at query column 0).
+         * te[l] is initialized to -1 and only overwritten when a new
+         * gmax is recorded, so te[l] < 0 cleanly marks lanes with no
+         * primary alignment. */
+        if (te[l] < 0 || !(minsc_msk_a & ((__mmask32)1 << l))) {
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
+            continue;
+        }
+
+        int len1_l  = (int)p[l].len1;
+        int low_l   = (int)low[l];
+        int high_l  = (int)high[l];
+        int minsc_l = (int)minsc[l];
+        int score2  = -1;
+        int te2     = -1;
+        /* b_pos = -2 sentinel: (-2 + 1) != any real row, forces "append"
+         * on the first qualifying row. */
+        int b_score = -1;
+        int b_pos   = -2;
+
+        int nrows = processed_rows < len1_l ? processed_rows : len1_l;
+        for (int i2 = 0; i2 < nrows; i2++) {
+            int imax = (int)rowMax[i2 * SIMD_WIDTH16 + l];
+            if (imax < minsc_l) continue;
+
+            if (b_pos + 1 != i2) {
+                /* APPEND: flush outgoing b[] entry to score2 first. */
+                if (b_pos >= 0 &&
+                    (b_pos < low_l || b_pos > high_l) &&
+                    b_score > score2) {
+                    score2 = b_score;
+                    te2    = b_pos;
+                }
+                b_score = imax;
+                b_pos   = i2;
+            } else if (b_score < imax) {
+                /* UPDATE: strict greater extends the run's anchor. */
+                b_score = imax;
+                b_pos   = i2;
+            }
+        }
+
+        /* Flush trailing b[] entry. */
+        if (b_pos >= 0 &&
+            (b_pos < low_l || b_pos > high_l) &&
+            b_score > score2) {
+            score2 = b_score;
+            te2    = b_pos;
+        }
+
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
+
     return 1;
 }
 
