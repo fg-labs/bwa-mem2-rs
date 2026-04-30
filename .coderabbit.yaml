@@ -1,0 +1,8 @@
+# CodeRabbit configuration.
+# Docs: https://docs.coderabbit.ai/getting-started/configure-coderabbit
+reviews:
+  path_filters:
+    # The bwa-mem3 vendor tree is a pristine snapshot of fg-labs/bwa-mem3@main
+    # (refreshed via scripts/refresh-bwa-mem3.sh) and is never edited in place.
+    # Findings on this tree must land upstream, not as patches in this repo.
+    - "!bwa-mem3-sys/vendor/**"
